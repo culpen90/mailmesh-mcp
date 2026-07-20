@@ -64,14 +64,14 @@ describe("GmailProvider", () => {
         threadId: "thread-1",
         labelIds: ["INBOX", "UNREAD"],
         snippet: "A short preview",
-        internalDate: "1767225600000",
+        internalDate: String(Date.parse("2026-07-20T12:00:00Z")),
         sizeEstimate: 321,
         payload: {
           headers: [
             { name: "Subject", value: "Status report" },
             { name: "From", value: "Ada <ada@example.com>" },
             { name: "To", value: "owner@example.com" },
-            { name: "Date", value: "Thu, 1 Jan 2026 00:00:00 +0000" },
+            { name: "Date", value: "Mon, 3 Aug 2026 07:36:00 +0000" },
           ],
         },
       });
@@ -89,11 +89,38 @@ describe("GmailProvider", () => {
         accountId: "gmail-1",
         subject: "Status report",
         from: { name: "Ada", email: "ada@example.com" },
+        receivedAt: "2026-07-20T12:00:00.000Z",
+        sentAt: "2026-08-03T07:36:00.000Z",
         isRead: false,
         hasAttachments: false,
       }),
     ]);
-    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("q=status");
+    const listUrl = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(listUrl.searchParams.get("q")).toBe("(status) -in:scheduled");
+  });
+
+  it("only returns pending scheduled sends when explicitly requested", async () => {
+    const queries: string[] = [];
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      queries.push(new URL(String(input)).searchParams.get("q") ?? "");
+      return json({ messages: [] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const provider = new GmailProvider(providerContext());
+
+    await provider.search({}, undefined, 10);
+    await provider.search({ query: "subject:lottery OR subject:tickets" }, undefined, 10);
+    await provider.search(
+      { query: 'in:scheduled "SNL Lottery"', includeScheduled: true },
+      undefined,
+      10,
+    );
+
+    expect(queries).toEqual([
+      "-in:scheduled",
+      "(subject:lottery OR subject:tickets) -in:scheduled",
+      '(in:scheduled "SNL Lottery")',
+    ]);
   });
 
   it("caps decoded body bytes and returns attachment metadata without downloading attachments", async () => {

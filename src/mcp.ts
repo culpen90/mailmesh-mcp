@@ -79,6 +79,9 @@ export function createMailMeshServer(env: Env): McpServer {
         before: z.string().max(40).optional().describe("ISO 8601 date or date-time, exclusive."),
         unread_only: z.boolean().optional(),
         has_attachments: z.boolean().optional().describe("Set true to require at least one attachment."),
+        include_scheduled: z.boolean().optional().describe(
+          "Include pending Gmail scheduled-send messages. They are excluded by default because their future schedule time is not a received-mail date.",
+        ),
         limit: z.number().int().min(1).max(50).default(20).describe(
           "Requested combined page size. MailMesh raises it when necessary to return at least one result per selected account.",
         ),
@@ -98,6 +101,7 @@ export function createMailMeshServer(env: Env): McpServer {
             before: input.before,
             unreadOnly: input.unread_only,
             hasAttachments: input.has_attachments === true ? true : undefined,
+            includeScheduled: input.include_scheduled === true ? true : undefined,
           },
           input.account_ids,
           input.limit,

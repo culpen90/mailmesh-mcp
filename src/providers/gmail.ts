@@ -320,7 +320,10 @@ function quoteSearchValue(value: string): string {
 
 function gmailQuery(filters: SearchFilters): string {
   const terms: string[] = [];
-  if (filters.query?.trim()) terms.push(filters.query.trim());
+  // Group the caller's raw Gmail expression so an OR branch cannot bypass
+  // structured filters or the default scheduled-message exclusion.
+  if (filters.query?.trim()) terms.push(`(${filters.query.trim()})`);
+  if (!filters.includeScheduled) terms.push("-in:scheduled");
   if (filters.from?.trim()) terms.push(`from:${quoteSearchValue(filters.from)}`);
   if (filters.to?.trim()) terms.push(`to:${quoteSearchValue(filters.to)}`);
   if (filters.after) {

@@ -8,7 +8,7 @@ It queries each provider live. It does not copy, index, train on, or cache mailb
 
 - `list_email_accounts` — list linked accounts without exposing credentials
 - `list_email_mailboxes` — list Gmail labels, Outlook folders, and IMAP mailboxes
-- `search_email` — search selected or all accounts and merge results by date
+- `search_email` — search selected or all accounts and merge results by date; pending Gmail scheduled sends are excluded unless `include_scheduled` is true
 - `get_email` — retrieve one size-capped message and attachment metadata
 - `create_email_draft` — optional; creates a draft but never sends it
 
