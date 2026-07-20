@@ -1,0 +1,49 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "mailmesh-mcp",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-07-20",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"vars": {
+		"PUBLIC_BASE_URL": "https://mailmesh-mcp.culpen0-workers.workers.dev",
+		"WRITE_MODE": "read-only",
+		"MAX_ACCOUNTS_PER_QUERY": "10",
+		"MAX_RESULTS_PER_QUERY": "30",
+		"MAX_MESSAGE_BYTES": "262144"
+	},
+	"secrets": {
+		"required": [
+			"MAILMESH_TOKEN",
+			"TOKEN_ENCRYPTION_KEY"
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "mailmesh",
+			"database_id": "3eca39ec-7f6d-4ecb-aa22-caf87617f9b8",
+			"migrations_dir": "migrations"
+		}
+	],
+	"observability": {
+		"enabled": true
+	},
+	"kv_namespaces": [
+		{
+			"binding": "OAUTH_KV",
+			"id": "68dc99582d844d62b2370276c4f02e3c"
+		}
+	],
+	"ratelimits": [
+		{
+			"name": "OAUTH_FLOW_RATE_LIMITER",
+			"namespace_id": "72026001",
+			"simple": {
+				"limit": 10,
+				"period": 60
+			}
+		}
+	]
+}

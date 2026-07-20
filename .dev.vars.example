@@ -1,0 +1,15 @@
+# Generate strong values; never commit the real file.
+MAILMESH_TOKEN="replace-with-a-random-bearer-token"
+TOKEN_ENCRYPTION_KEY="replace-with-base64-encoded-32-random-bytes"
+
+# Only needed for the providers you link.
+GOOGLE_CLIENT_ID=""
+GOOGLE_CLIENT_SECRET=""
+MICROSOFT_CLIENT_ID=""
+MICROSOFT_CLIENT_SECRET=""
+
+# Override the public Worker URL after deployment.
+PUBLIC_BASE_URL="http://localhost:8787"
+
+# read-only (default) or drafts. MailMesh never sends messages.
+WRITE_MODE="read-only"
