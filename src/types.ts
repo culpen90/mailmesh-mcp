@@ -133,6 +133,7 @@ export interface SearchFilters {
   before?: string;
   unreadOnly?: boolean;
   hasAttachments?: boolean;
+  includeScheduled?: boolean;
 }
 
 export interface ProviderSearchPage {
