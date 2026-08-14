@@ -143,7 +143,13 @@ async function performOAuthRefresh(
   };
 
   const encrypted = await encryptCredentials(updated, context.env.TOKEN_ENCRYPTION_KEY);
-  await updateAccountCredentials(context.env.DB, context.account.id, encrypted, updated.scope);
+  await updateAccountCredentials(
+    context.env.DB,
+    context.account.userId,
+    context.account.id,
+    encrypted,
+    updated.scope,
+  );
   context.credentials = updated;
   context.account.encryptedCredentials = encrypted;
   context.account.scopes = updated.scope;

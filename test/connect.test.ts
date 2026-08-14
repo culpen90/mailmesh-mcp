@@ -20,7 +20,7 @@ function env(overrides: Partial<Env> = {}): Env {
   };
 }
 
-describe("cross-computer Gmail connection page", () => {
+describe("cross-computer email connection page", () => {
   it("serves a no-store page with matching script and style nonces", async () => {
     const response = await handleConnectRequest(new Request(`${workerOrigin}/connect`), env());
     const body = await response?.text();
@@ -36,17 +36,18 @@ describe("cross-computer Gmail connection page", () => {
     expect(body).toContain(`<style nonce="${nonce}">`);
   });
 
-  it("keeps the access token out of HTML fields, URLs, and browser storage", async () => {
+  it("keeps login credentials out of HTML values, URLs, and browser storage", async () => {
     const response = await handleConnectRequest(
       new Request(`${workerOrigin}/connect?token=${encodeURIComponent(adminToken)}`),
       env(),
     );
     const body = await response?.text() ?? "";
 
-    expect(body).toContain("Add a Gmail account");
-    expect(body).toMatch(/<input id="token"(?![^>]*\bname=)[^>]*type="password"/);
-    expect(body).toContain('authorization: "Bearer " + token');
-    expect(body).toContain('fetch("/admin/oauth/start"');
+    expect(body).toContain("Connect an email account");
+    expect(body).toMatch(/<input id="username"(?![^>]*\bname=)[^>]*type="text"/);
+    expect(body).toMatch(/<input id="password"(?![^>]*\bname=)[^>]*type="password"/);
+    expect(body).toContain('authorization: basicAuthorization(username, password)');
+    expect(body).toContain('fetch("/api/oauth/start"');
     expect(body).not.toContain(adminToken);
     expect(body).not.toContain("localStorage");
     expect(body).not.toContain("sessionStorage");
@@ -56,8 +57,9 @@ describe("cross-computer Gmail connection page", () => {
     const response = await handleConnectRequest(new Request(`${workerOrigin}/connect`), env());
     const body = await response?.text() ?? "";
 
-    expect(body).toContain('destination.origin !== "https://accounts.google.com"');
-    expect(body).toContain('destination.pathname !== "/o/oauth2/v2/auth"');
+    expect(body).toContain('destination.origin === "https://accounts.google.com"');
+    expect(body).toContain('destination.pathname === "/o/oauth2/v2/auth"');
+    expect(body).toContain('destination.origin === "https://login.microsoftonline.com"');
     expect(body).toContain("location.replace(destination.href)");
   });
 

@@ -5,6 +5,7 @@ const dbMocks = vi.hoisted(() => ({
   createOAuthState: vi.fn(async () => undefined),
   deleteExpiredOAuthStates: vi.fn(async () => 0),
   getAccountByProviderEmail: vi.fn(),
+  getUserById: vi.fn(),
   upsertAccount: vi.fn(),
 }));
 
@@ -23,6 +24,7 @@ import {
   oauthScopes,
   startOAuth,
 } from "../src/oauth";
+import { encryptCredentials } from "../src/crypto";
 import type { AccountRecord, Env } from "../src/types";
 
 const workerOrigin = "https://mailmesh.example.com";
@@ -44,7 +46,23 @@ function oauthEnv(): Env {
 describe("provider OAuth configuration", () => {
   beforeEach(() => {
     dbMocks.consumeOAuthState.mockReset();
+    dbMocks.createOAuthState.mockReset();
+    dbMocks.createOAuthState.mockResolvedValue(undefined);
     dbMocks.getAccountByProviderEmail.mockReset();
+    dbMocks.getUserById.mockReset();
+    dbMocks.getUserById.mockResolvedValue({
+      id: "mailmesh-owner",
+      username: "owner",
+      displayName: "Owner",
+      passwordAlgorithm: "pbkdf2-sha256-hmac-pepper-v1",
+      passwordHash: "A".repeat(43),
+      passwordSalt: "A".repeat(22),
+      passwordIterations: 50_000,
+      authVersion: 1,
+      enabled: true,
+      createdAt: "2026-07-20T00:00:00.000Z",
+      updatedAt: "2026-07-20T00:00:00.000Z",
+    });
     dbMocks.upsertAccount.mockReset();
   });
 
@@ -86,11 +104,15 @@ describe("provider OAuth configuration", () => {
       GOOGLE_CLIENT_ID: "google-client",
       GOOGLE_CLIENT_SECRET: "google-secret",
       WRITE_MODE: "read-only",
-    }, { provider: "gmail", label: "Second Gmail" });
+    }, "mailmesh-owner", { provider: "gmail", label: "Second Gmail" });
 
     const authorizationUrl = new URL(result.authorizationUrl);
     expect(authorizationUrl.searchParams.get("prompt")).toBe("consent select_account");
     expect(authorizationUrl.searchParams.get("access_type")).toBe("offline");
+    expect(dbMocks.createOAuthState).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ userId: "mailmesh-owner", provider: "gmail" }),
+    );
   });
 
   it.each([
@@ -99,6 +121,7 @@ describe("provider OAuth configuration", () => {
   ])("%s", async (_description, savedLabel, expectedLabel) => {
     const existing: AccountRecord = {
       id: "gmail-account",
+      userId: "mailmesh-owner",
       provider: "gmail",
       email: "work@example.com",
       label: "Primary account",
@@ -111,6 +134,7 @@ describe("provider OAuth configuration", () => {
       lastError: null,
     };
     dbMocks.consumeOAuthState.mockResolvedValue({
+      userId: "mailmesh-owner",
       provider: "gmail",
       label: savedLabel,
       codeVerifier: "test-code-verifier",
@@ -148,10 +172,106 @@ describe("provider OAuth configuration", () => {
       expect.anything(),
       expect.objectContaining({
         email: "work@example.com",
+        userId: "mailmesh-owner",
         label: expectedLabel,
         providerConfig: { tenant: "example" },
         scopes: expect.stringContaining("https://www.googleapis.com/auth/gmail.compose"),
       }),
     );
+    expect(dbMocks.getAccountByProviderEmail).toHaveBeenCalledWith(
+      expect.anything(),
+      "mailmesh-owner",
+      "gmail",
+      "work@example.com",
+    );
+  });
+
+  it("rejects a callback when its state owner has been disabled", async () => {
+    dbMocks.consumeOAuthState.mockResolvedValue({
+      userId: "disabled-user",
+      provider: "gmail",
+      label: "",
+      codeVerifier: "test-code-verifier",
+      expiresAt: "2026-08-14T16:00:00.000Z",
+      createdAt: "2026-08-14T15:50:00.000Z",
+    });
+    dbMocks.getUserById.mockResolvedValue({ id: "disabled-user", enabled: false });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(completeOAuthCallback(
+      new Request(`${workerOrigin}/oauth/callback/gmail?state=test-state&code=test-code`),
+      oauthEnv(),
+      "gmail",
+    )).rejects.toMatchObject({ code: "user_unavailable", status: 403 });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(dbMocks.upsertAccount).not.toHaveBeenCalled();
+  });
+
+  it("never borrows another user's refresh token for the same provider email", async () => {
+    const environment = oauthEnv();
+    const otherUserAccount: AccountRecord = {
+      id: "user-b-gmail",
+      userId: "user-b",
+      provider: "gmail",
+      email: "shared@example.com",
+      label: "User B Gmail",
+      encryptedCredentials: await encryptCredentials({
+        kind: "oauth",
+        accessToken: "user-b-access-token",
+        refreshToken: "user-b-refresh-token",
+        expiresAt: Date.now() + 3_600_000,
+        tokenType: "Bearer",
+        scope: "openid email",
+      }, environment.TOKEN_ENCRYPTION_KEY),
+      providerConfig: {},
+      scopes: "openid email",
+      enabled: true,
+      createdAt: "2026-08-14T00:00:00.000Z",
+      updatedAt: "2026-08-14T00:00:00.000Z",
+      lastError: null,
+    };
+    dbMocks.consumeOAuthState.mockResolvedValue({
+      userId: "user-a",
+      provider: "gmail",
+      label: "User A Gmail",
+      codeVerifier: "user-a-code-verifier",
+      expiresAt: "2026-08-14T16:00:00.000Z",
+      createdAt: "2026-08-14T15:50:00.000Z",
+    });
+    dbMocks.getUserById.mockResolvedValue({ id: "user-a", enabled: true });
+    dbMocks.getAccountByProviderEmail.mockImplementation(async (_db, userId) => (
+      userId === "user-a" ? null : otherUserAccount
+    ));
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url === "https://oauth2.googleapis.com/token") {
+        return new Response(JSON.stringify({
+          access_token: "user-a-access-token",
+          expires_in: 3_600,
+          token_type: "Bearer",
+          scope: "openid email",
+        }), { headers: { "content-type": "application/json" } });
+      }
+      if (url === "https://openidconnect.googleapis.com/v1/userinfo") {
+        return new Response(JSON.stringify({ email: "shared@example.com", email_verified: true }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+
+    await expect(completeOAuthCallback(
+      new Request(`${workerOrigin}/oauth/callback/gmail?state=user-a-state&code=user-a-code`),
+      environment,
+      "gmail",
+    )).rejects.toMatchObject({ code: "oauth_refresh_token_missing", status: 400 });
+    expect(dbMocks.getAccountByProviderEmail).toHaveBeenCalledWith(
+      expect.anything(),
+      "user-a",
+      "gmail",
+      "shared@example.com",
+    );
+    expect(dbMocks.upsertAccount).not.toHaveBeenCalled();
   });
 });

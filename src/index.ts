@@ -2,6 +2,7 @@ import { OAuthError, OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp";
 import { handleAdminRequest } from "./admin";
 import { constantTimeEqual } from "./crypto";
+import { getUserById, LEGACY_OWNER_USER_ID } from "./db";
 import { asMailMeshError } from "./errors";
 import {
   AUTHORIZATION_SCOPES,
@@ -37,6 +38,8 @@ interface McpAuthProps {
   principal: string;
   authType: "oauth" | "static";
   scopes: string[];
+  userId?: string;
+  authVersion?: number;
   canCreateDrafts?: boolean;
 }
 
@@ -56,7 +59,16 @@ const mcpApiHandler = {
         { "www-authenticate": 'Bearer error="insufficient_scope", scope="mail:read"' },
       );
     }
-    return createMcpHandler(createMailMeshServer(env, {
+    const legacyGrant = props.userId === undefined && props.principal === LEGACY_OWNER_USER_ID;
+    const userId = props.userId ?? (legacyGrant ? LEGACY_OWNER_USER_ID : undefined);
+    if (!userId) {
+      return jsonResponse({ error: "invalid_token", error_description: "The MailMesh user is missing" }, 401);
+    }
+    const user = await getUserById(env.DB, userId);
+    if (!user?.enabled || (!legacyGrant && props.authVersion !== user.authVersion)) {
+      return jsonResponse({ error: "invalid_token", error_description: "The MailMesh user is unavailable" }, 401);
+    }
+    return createMcpHandler(createMailMeshServer(env, userId, {
       createDrafts: props.canCreateDrafts === true,
     }), { route: "/mcp" })(request, env, ctx);
   },
@@ -85,7 +97,7 @@ const applicationHandler = {
         authorization: "OAuth 2.1 with PKCE",
         health: "/health",
         connect: "/connect",
-        privacy: "Single-user; mailbox content is queried live and is not stored.",
+        privacy: "Tenant-isolated; mailbox content is queried live and is not stored.",
       });
       return request.method === "HEAD" ? new Response(null, response) : response;
     }
@@ -128,12 +140,16 @@ function oauthProvider(env: Env): OAuthProvider<Env> {
     clientRegistrationCallback: validateMcpClientRegistration,
     resolveExternalToken: async ({ token, env: runtimeEnv }) => {
       if (!(await constantTimeEqual(token, runtimeEnv.MAILMESH_TOKEN))) return null;
+      const owner = await getUserById(runtimeEnv.DB, LEGACY_OWNER_USER_ID);
+      if (!owner?.enabled) return null;
       return {
         audience: resource,
         props: {
-          principal: "mailmesh-owner",
+          principal: LEGACY_OWNER_USER_ID,
           authType: "static",
           scopes: [MAIL_READ_SCOPE],
+          userId: LEGACY_OWNER_USER_ID,
+          authVersion: owner.authVersion,
           canCreateDrafts: runtimeEnv.WRITE_MODE === "drafts",
         } satisfies McpAuthProps,
       };

@@ -7,6 +7,7 @@ import {
   validateMcpClientRegistration,
 } from "../src/mcp-authorization";
 import type { Env } from "../src/types";
+import { createPasswordData } from "../src/user-auth";
 
 const origin = "https://mailmesh.example.com";
 const resource = `${origin}/mcp`;
@@ -69,17 +70,34 @@ function setup(
       redirectTo: `${requestInfo.redirectUri}?code=short-lived-code&state=${requestInfo.state}`,
     })),
   } as unknown as OAuthHelpers;
+  const ownerRow = {
+    id: "mailmesh-owner",
+    username: "owner",
+    display_name: "MailMesh Owner",
+    password_algorithm: "",
+    password_hash: "",
+    password_salt: "",
+    password_iterations: 0,
+    auth_version: 1,
+    enabled: 1,
+    created_at: "2026-07-20T00:00:00.000Z",
+    updated_at: "2026-07-20T00:00:00.000Z",
+  };
+  const first = vi.fn(async () => ownerRow);
+  const bind = vi.fn(() => ({ first }));
+  const prepare = vi.fn(() => ({ bind }));
   const environment = {
-    DB: {} as D1Database,
+    DB: { prepare } as unknown as D1Database,
     OAUTH_KV: kv as unknown as KVNamespace,
     OAUTH_FLOW_RATE_LIMITER: { limit: vi.fn(async () => ({ success: true })) } as unknown as RateLimit,
+    AUTH_RATE_LIMITER: { limit: vi.fn(async () => ({ success: true })) } as unknown as RateLimit,
     OAUTH_PROVIDER: helpers,
     MAILMESH_TOKEN: ownerToken,
-    TOKEN_ENCRYPTION_KEY: "unused-in-mcp-authorization-test",
+    TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 5).toString("base64"),
     PUBLIC_BASE_URL: origin,
     WRITE_MODE: writeMode,
   } satisfies Env;
-  return { kv, requestInfo, clientInfo, helpers, environment };
+  return { kv, requestInfo, clientInfo, helpers, environment, ownerRow };
 }
 
 function hiddenValue(body: string, id: string): string {
@@ -125,6 +143,25 @@ function consentRequest(
   });
 }
 
+function basicConsentRequest(
+  consentId: string,
+  csrfToken: string,
+  cookie: string,
+  username: string,
+  password: string,
+): Request {
+  return new Request(`${origin}/authorize`, {
+    method: "POST",
+    headers: {
+      authorization: `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`,
+      "content-type": "application/json",
+      cookie,
+      origin,
+    },
+    body: JSON.stringify({ consent_id: consentId, csrf_token: csrfToken, decision: "approve" }),
+  });
+}
+
 describe("MCP OAuth authorization", () => {
   it("renders escaped client metadata with strict consent protections", async () => {
     const maliciousName = '<img src=x onerror="alert(1)">';
@@ -142,8 +179,9 @@ describe("MCP OAuth authorization", () => {
     expect(body).not.toContain(maliciousName);
     expect(body).not.toContain("attacker.example");
     expect(body).toContain("Will return to claude.ai");
-    expect(body).toMatch(/<input id="token"(?![^>]*\bname=)[^>]*type="password"/);
-    expect(body).toContain('headers.authorization = "Bearer " + token');
+    expect(body).toMatch(/<input id="username"(?![^>]*\bname=)[^>]*type="text"/);
+    expect(body).toMatch(/<input id="password"(?![^>]*\bname=)[^>]*type="password"/);
+    expect(body).toContain("headers.authorization = basicAuthorization(username, password)");
     expect(body).not.toContain(ownerToken);
     expect(body).not.toContain("localStorage");
     expect(body).not.toContain("sessionStorage");
@@ -188,6 +226,8 @@ describe("MCP OAuth authorization", () => {
       scope: ["mail:read", "offline_access"],
       props: expect.objectContaining({
         authType: "oauth",
+        userId: "mailmesh-owner",
+        authVersion: 1,
         scopes: ["mail:read", "offline_access"],
         canCreateDrafts: false,
       }),
@@ -199,6 +239,37 @@ describe("MCP OAuth authorization", () => {
     );
     expect(replay?.status).toBe(400);
     expect(helpers.completeAuthorization).toHaveBeenCalledTimes(1);
+  });
+
+  it("issues a tenant-bound grant after password authentication", async () => {
+    const { environment, helpers, ownerRow } = setup();
+    const password = "tenant-password:42";
+    const passwordData = await createPasswordData(password, environment.TOKEN_ENCRYPTION_KEY);
+    Object.assign(ownerRow, {
+      id: "user-a",
+      username: "user.a",
+      display_name: "User A",
+      password_algorithm: passwordData.algorithm,
+      password_hash: passwordData.hash,
+      password_salt: passwordData.salt,
+      password_iterations: passwordData.iterations,
+      auth_version: 7,
+    });
+    const { consentId, csrfToken, cookie } = await begin(environment);
+    const response = await handleMcpAuthorizationRequest(
+      basicConsentRequest(consentId, csrfToken, cookie, "user.a", password),
+      environment,
+    );
+
+    expect(response?.status).toBe(200);
+    expect(helpers.completeAuthorization).toHaveBeenCalledWith(expect.objectContaining({
+      userId: "user-a",
+      props: expect.objectContaining({
+        principal: "user:user-a",
+        userId: "user-a",
+        authVersion: 7,
+      }),
+    }));
   });
 
   it("rejects the wrong owner token without echoing it", async () => {

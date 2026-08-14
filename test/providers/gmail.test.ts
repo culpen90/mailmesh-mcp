@@ -24,6 +24,7 @@ function providerContext(provider: EmailProvider = "gmail", maxMessageBytes = 10
     },
     account: {
       id: "gmail-1",
+      userId: "mailmesh-owner",
       provider,
       email: "owner@example.com",
       label: "Personal",

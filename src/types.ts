@@ -6,6 +6,7 @@ export interface Env {
   DB: D1Database;
   OAUTH_KV: KVNamespace;
   OAUTH_FLOW_RATE_LIMITER: RateLimit;
+  AUTH_RATE_LIMITER?: RateLimit;
   OAUTH_PROVIDER?: OAuthHelpers;
   MAILMESH_TOKEN: string;
   TOKEN_ENCRYPTION_KEY: string;
@@ -22,6 +23,7 @@ export interface Env {
 
 export interface AccountRecord {
   id: string;
+  userId: string;
   provider: EmailProvider;
   email: string;
   label: string;
@@ -142,9 +144,39 @@ export interface ProviderSearchPage {
 }
 
 export interface UnifiedSearchCursor {
-  v: 1;
+  v: 2;
+  userId: string;
   fingerprint: string;
   accounts: Record<string, string | null>;
+}
+
+export interface UserRecord {
+  id: string;
+  username: string;
+  displayName: string;
+  passwordAlgorithm: string;
+  passwordHash: string;
+  passwordSalt: string;
+  passwordIterations: number;
+  authVersion: number;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PublicUser {
+  id: string;
+  username: string;
+  displayName: string;
+  enabled: boolean;
+  passwordConfigured: boolean;
+  authVersion: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AdminAccount extends PublicAccount {
+  userId: string;
 }
 
 export interface DraftInput {
