@@ -37,6 +37,7 @@ interface McpAuthProps {
   principal: string;
   authType: "oauth" | "static";
   scopes: string[];
+  canCreateDrafts?: boolean;
 }
 
 type OAuthExecutionContext = ExecutionContext & { props?: McpAuthProps };
@@ -55,7 +56,9 @@ const mcpApiHandler = {
         { "www-authenticate": 'Bearer error="insufficient_scope", scope="mail:read"' },
       );
     }
-    return createMcpHandler(createMailMeshServer(env), { route: "/mcp" })(request, env, ctx);
+    return createMcpHandler(createMailMeshServer(env, {
+      createDrafts: props.canCreateDrafts === true,
+    }), { route: "/mcp" })(request, env, ctx);
   },
 } satisfies ExportedHandler<Env>;
 
@@ -131,6 +134,7 @@ function oauthProvider(env: Env): OAuthProvider<Env> {
           principal: "mailmesh-owner",
           authType: "static",
           scopes: [MAIL_READ_SCOPE],
+          canCreateDrafts: runtimeEnv.WRITE_MODE === "drafts",
         } satisfies McpAuthProps,
       };
     },

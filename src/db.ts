@@ -142,6 +142,27 @@ export async function getAccountByProviderEmail(
   return row ? mapAccountRow(row) : null;
 }
 
+export async function updateAccountLabel(
+  db: D1Database,
+  accountId: string,
+  label: string,
+): Promise<AccountRecord | null> {
+  const normalized = label.trim();
+  if (!normalized || normalized.length > 100) {
+    throw new MailMeshError("invalid_label", "Account label must be between 1 and 100 characters", 400);
+  }
+  const row = await db
+    .prepare(
+      `UPDATE email_accounts
+       SET label = ?2, updated_at = ?3
+       WHERE id = ?1
+       RETURNING *`,
+    )
+    .bind(accountId, normalized, new Date().toISOString())
+    .first<AccountRow>();
+  return row ? mapAccountRow(row) : null;
+}
+
 export async function createAccount(db: D1Database, input: AccountWrite): Promise<AccountRecord> {
   const account = normalizeAccountWrite(input);
   const now = new Date().toISOString();

@@ -1,6 +1,13 @@
 import { encryptCredentials, requireAdminAuth } from "./crypto";
 import { handleConnectRequest } from "./connect";
-import { deleteAccount, getAccountByProviderEmail, listAccounts, toPublicAccount, upsertAccount } from "./db";
+import {
+  deleteAccount,
+  getAccountByProviderEmail,
+  listAccounts,
+  toPublicAccount,
+  updateAccountLabel,
+  upsertAccount,
+} from "./db";
 import { asMailMeshError, MailMeshError } from "./errors";
 import { completeOAuthCallback, startOAuth, type OAuthStartInput } from "./oauth";
 import type { Env, ImapCredentials, ImapProviderConfig } from "./types";
@@ -21,6 +28,10 @@ interface ImapAccountInput {
 
 interface OAuthAdminInput {
   provider?: unknown;
+  label?: unknown;
+}
+
+interface AccountUpdateInput {
   label?: unknown;
 }
 
@@ -186,15 +197,29 @@ export async function handleAdminRequest(request: Request, env: Env): Promise<Re
 
     const accountMatch = /^\/admin\/accounts\/([^/]+)\/?$/.exec(url.pathname);
     if (accountMatch) {
-      if (request.method !== "DELETE") return methodNotAllowed("DELETE");
       const accountId = decodeURIComponent(accountMatch[1] ?? "");
       if (!accountId || accountId.length > 128) {
         throw new MailMeshError("invalid_request", "Account ID is invalid", 400);
       }
-      if (!(await deleteAccount(env.DB, accountId))) {
-        throw new MailMeshError("account_not_found", "Account not found", 404, false, accountId);
+
+      if (request.method === "PATCH") {
+        const input = await parseJsonBody<AccountUpdateInput>(request);
+        const label = requiredString(input.label, "label", 100);
+        const account = await updateAccountLabel(env.DB, accountId, label);
+        if (!account) {
+          throw new MailMeshError("account_not_found", "Account not found", 404, false, accountId);
+        }
+        return jsonResponse({ account: toPublicAccount(account) });
       }
-      return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+
+      if (request.method === "DELETE") {
+        if (!(await deleteAccount(env.DB, accountId))) {
+          throw new MailMeshError("account_not_found", "Account not found", 404, false, accountId);
+        }
+        return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+      }
+
+      return methodNotAllowed("PATCH, DELETE");
     }
 
     return jsonResponse(

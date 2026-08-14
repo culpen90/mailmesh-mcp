@@ -19,9 +19,12 @@ function noticeFor(url: URL, override?: Notice): Notice | undefined {
   return undefined;
 }
 
-function connectPage(url: URL, status = 200, override?: Notice): Response {
+function connectPage(url: URL, env: Pick<Env, "WRITE_MODE">, status = 200, override?: Notice): Response {
   const nonce = randomBase64Url(18);
   const notice = noticeFor(url, override);
+  const accessDescription = env.WRITE_MODE === "drafts"
+    ? "MailMesh can create drafts after you approve Google&#039;s compose permission, but it still cannot send email."
+    : "Mail access remains read-only.";
   const alert = notice
     ? `<div class="alert ${notice.kind}" role="status">${notice.message}</div>`
     : "";
@@ -61,7 +64,7 @@ function connectPage(url: URL, status = 200, override?: Notice): Response {
 <body>
   <main>
     <h1>Add a Gmail account</h1>
-    <p>Connect another Gmail to your private MailMesh server. Mail access remains read-only.</p>
+    <p>Connect another Gmail to your private MailMesh server. ${accessDescription}</p>
     ${alert}
     <form id="connect-form" autocomplete="off">
       <label for="token">MailMesh access token — not your Gmail password</label>
@@ -161,17 +164,18 @@ function connectPage(url: URL, status = 200, override?: Notice): Response {
 }
 
 /** Serve the browser-based Gmail connection page without persisting its admin token. */
-export async function handleConnectRequest(request: Request, _env: Env): Promise<Response | null> {
+export async function handleConnectRequest(request: Request, env: Env): Promise<Response | null> {
   const url = new URL(request.url);
   if (url.pathname !== CONNECT_PATH && url.pathname !== `${CONNECT_PATH}/`) return null;
 
   if (request.method === "GET" || request.method === "HEAD") {
-    const response = connectPage(url);
+    const response = connectPage(url, env);
     return request.method === "HEAD" ? new Response(null, response) : response;
   }
 
   const response = connectPage(
     url,
+    env,
     405,
     { kind: "error", message: "This page only accepts GET or HEAD requests." },
   );

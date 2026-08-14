@@ -5,7 +5,7 @@ import type { Env } from "../src/types";
 const workerOrigin = "https://mailmesh.example.com";
 const adminToken = "test-token-with-at-least-256-bits-of-randomness";
 
-function env(): Env {
+function env(overrides: Partial<Env> = {}): Env {
   return {
     DB: {} as D1Database,
     OAUTH_KV: {} as KVNamespace,
@@ -16,6 +16,7 @@ function env(): Env {
     GOOGLE_CLIENT_ID: "google-client",
     GOOGLE_CLIENT_SECRET: "google-secret",
     WRITE_MODE: "read-only",
+    ...overrides,
   };
 }
 
@@ -58,6 +59,23 @@ describe("cross-computer Gmail connection page", () => {
     expect(body).toContain('destination.origin !== "https://accounts.google.com"');
     expect(body).toContain('destination.pathname !== "/o/oauth2/v2/auth"');
     expect(body).toContain("location.replace(destination.href)");
+  });
+
+  it("discloses draft access only when draft mode is enabled", async () => {
+    const readOnlyBody = await (await handleConnectRequest(
+      new Request(`${workerOrigin}/connect`),
+      env(),
+    ))?.text() ?? "";
+    const draftBody = await (await handleConnectRequest(
+      new Request(`${workerOrigin}/connect`),
+      env({ WRITE_MODE: "drafts" }),
+    ))?.text() ?? "";
+
+    expect(readOnlyBody).toContain("Mail access remains read-only.");
+    expect(readOnlyBody).not.toContain("compose permission");
+    expect(draftBody).toContain("can create drafts");
+    expect(draftBody).toContain("compose permission");
+    expect(draftBody).toContain("still cannot send email");
   });
 
   it("returns matching headers and no body for HEAD", async () => {
