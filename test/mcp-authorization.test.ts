@@ -54,7 +54,11 @@ function client(overrides: Partial<ClientInfo> = {}): ClientInfo {
   };
 }
 
-function setup(requestOverrides: Partial<AuthRequest> = {}, clientOverrides: Partial<ClientInfo> = {}) {
+function setup(
+  requestOverrides: Partial<AuthRequest> = {},
+  clientOverrides: Partial<ClientInfo> = {},
+  writeMode: Env["WRITE_MODE"] = "read-only",
+) {
   const kv = new MemoryKv();
   const requestInfo = authRequest(requestOverrides);
   const clientInfo = client(clientOverrides);
@@ -73,7 +77,7 @@ function setup(requestOverrides: Partial<AuthRequest> = {}, clientOverrides: Par
     MAILMESH_TOKEN: ownerToken,
     TOKEN_ENCRYPTION_KEY: "unused-in-mcp-authorization-test",
     PUBLIC_BASE_URL: origin,
-    WRITE_MODE: "read-only",
+    WRITE_MODE: writeMode,
   } satisfies Env;
   return { kv, requestInfo, clientInfo, helpers, environment };
 }
@@ -145,10 +149,29 @@ describe("MCP OAuth authorization", () => {
     expect(body).not.toContain("sessionStorage");
   });
 
+  it("discloses draft creation in consent when draft mode is enabled", async () => {
+    const { environment, helpers } = setup({}, {}, "drafts");
+    const { body, consentId, csrfToken, cookie } = await begin(environment);
+
+    expect(body).toContain("to create drafts");
+    expect(body).toContain("It cannot send");
+    expect(body).toContain("Allow read and draft access");
+    expect(body).not.toContain("Allow read-only access");
+
+    await handleMcpAuthorizationRequest(
+      consentRequest(consentId, csrfToken, cookie),
+      environment,
+    );
+    expect(helpers.completeAuthorization).toHaveBeenCalledWith(expect.objectContaining({
+      props: expect.objectContaining({ canCreateDrafts: true }),
+    }));
+  });
+
   it("stores the validated request server-side and completes one authorization", async () => {
     const { environment, helpers, kv } = setup();
     const { consentId, csrfToken, cookie } = await begin(environment);
     expect(kv.values.size).toBe(1);
+    environment.WRITE_MODE = "drafts";
 
     const response = await handleMcpAuthorizationRequest(
       consentRequest(consentId, csrfToken, cookie),
@@ -163,7 +186,11 @@ describe("MCP OAuth authorization", () => {
     expect(helpers.completeAuthorization).toHaveBeenCalledWith(expect.objectContaining({
       userId: "mailmesh-owner",
       scope: ["mail:read", "offline_access"],
-      props: expect.objectContaining({ authType: "oauth", scopes: ["mail:read", "offline_access"] }),
+      props: expect.objectContaining({
+        authType: "oauth",
+        scopes: ["mail:read", "offline_access"],
+        canCreateDrafts: false,
+      }),
     }));
 
     const replay = await handleMcpAuthorizationRequest(

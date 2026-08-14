@@ -26,6 +26,7 @@ interface StoredConsent {
   request: AuthRequest;
   csrfToken: string;
   scopes: string[];
+  canCreateDrafts: boolean;
 }
 
 interface ConsentSubmission {
@@ -36,7 +37,7 @@ interface ConsentSubmission {
 
 type OAuthEnv = Pick<
   Env,
-  "MAILMESH_TOKEN" | "OAUTH_FLOW_RATE_LIMITER" | "OAUTH_KV" | "OAUTH_PROVIDER" | "PUBLIC_BASE_URL"
+  "MAILMESH_TOKEN" | "OAUTH_FLOW_RATE_LIMITER" | "OAUTH_KV" | "OAUTH_PROVIDER" | "PUBLIC_BASE_URL" | "WRITE_MODE"
 >;
 
 export function canonicalPublicBaseUrl(env: Pick<Env, "PUBLIC_BASE_URL">): string {
@@ -155,7 +156,8 @@ function isStoredConsent(value: unknown): value is StoredConsent {
     typeof candidate.csrfToken === "string" &&
     candidate.csrfToken.length >= 32 &&
     Array.isArray(candidate.scopes) &&
-    candidate.scopes.every((scope) => typeof scope === "string")
+    candidate.scopes.every((scope) => typeof scope === "string") &&
+    typeof candidate.canCreateDrafts === "boolean"
   );
 }
 
@@ -171,6 +173,7 @@ function consentPage(
   authRequest: AuthRequest,
   client: ClientInfo,
   scopes: string[],
+  canCreateDrafts: boolean,
 ): Response {
   const nonce = randomBase64Url(18);
   const name = htmlEscape(clientDisplayName(client));
@@ -179,6 +182,10 @@ function consentPage(
   const offline = scopes.includes(OFFLINE_ACCESS_SCOPE)
     ? " It also asked to stay connected so it can refresh its short-lived access token."
     : "";
+  const accessDescription = canCreateDrafts
+    ? "This gives the requesting app access to search and read email across linked accounts, and to create drafts in linked Gmail and Microsoft accounts. It cannot send, delete, move, or mark email as read."
+    : "This gives the requesting app read-only access to search and read email across accounts already linked to MailMesh. It cannot send, delete, move, or mark email as read.";
+  const approvalLabel = canCreateDrafts ? "Allow read and draft access" : "Allow read-only access";
   const body = `<!doctype html>
 <html lang="en">
 <head>
@@ -219,7 +226,7 @@ function consentPage(
 <body>
   <main>
     <h1>Allow access to MailMesh?</h1>
-    <p>This gives the requesting app read-only access to search and read email across the Gmail accounts already linked to MailMesh. It cannot send, delete, move, or mark email as read.${offline}</p>
+    <p>${accessDescription}${offline}</p>
     <div class="client"><strong>${name}</strong><span>Will return to ${redirectTarget}</span></div>
     <form id="consent-form" autocomplete="off">
       <input id="consent-id" type="hidden" value="${htmlEscape(consentId)}">
@@ -228,7 +235,7 @@ function consentPage(
       <input id="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false">
       <div class="actions">
         <button type="submit" name="decision" value="deny">Cancel</button>
-        <button type="submit" name="decision" value="approve">Allow read-only access</button>
+        <button type="submit" name="decision" value="approve">${approvalLabel}</button>
       </div>
     </form>
     <p class="note">The app never receives this permanent token. MailMesh uses it only to confirm that you are the owner, then issues separate short-lived OAuth credentials.</p>
@@ -355,11 +362,12 @@ async function showConsent(request: Request, env: OAuthEnv, helpers: OAuthHelper
 
     const consentId = randomBase64Url(32);
     const csrfToken = randomBase64Url(32);
-    const stored: StoredConsent = { request: authRequest, csrfToken, scopes };
+    const canCreateDrafts = env.WRITE_MODE === "drafts";
+    const stored: StoredConsent = { request: authRequest, csrfToken, scopes, canCreateDrafts };
     await env.OAUTH_KV.put(`${CONSENT_KEY_PREFIX}${consentId}`, JSON.stringify(stored), {
       expirationTtl: CONSENT_TTL_SECONDS,
     });
-    return consentPage(consentId, csrfToken, authRequest, client, scopes);
+    return consentPage(consentId, csrfToken, authRequest, client, scopes, canCreateDrafts);
   } catch {
     return authorizationErrorPage();
   }
@@ -416,7 +424,12 @@ async function finishConsent(request: Request, env: OAuthEnv, helpers: OAuthHelp
       userId: "mailmesh-owner",
       metadata: { kind: "mailmesh-mcp", authorizedAt: new Date().toISOString() },
       scope: stored.scopes,
-      props: { principal: "mailmesh-owner", authType: "oauth", scopes: stored.scopes },
+      props: {
+        principal: "mailmesh-owner",
+        authType: "oauth",
+        scopes: stored.scopes,
+        canCreateDrafts: stored.canCreateDrafts,
+      },
     });
     return jsonResponse({ redirectTo }, 200, { "set-cookie": clearCsrfCookie() });
   } catch {

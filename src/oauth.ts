@@ -8,7 +8,7 @@ import {
   upsertAccount,
 } from "./db";
 import { MailMeshError } from "./errors";
-import type { EmailProvider, Env, OAuthCredentials, PublicAccount } from "./types";
+import type { AccountRecord, Env, OAuthCredentials, PublicAccount } from "./types";
 import { readErrorResponse } from "./utils/http";
 
 export type OAuthProviderName = "google" | "microsoft";
@@ -263,10 +263,8 @@ async function fetchProfileEmail(provider: OAuthProviderName, accessToken: strin
 
 async function existingRefreshToken(
   env: Env,
-  provider: EmailProvider,
-  email: string,
+  existing: AccountRecord | null,
 ): Promise<string | null> {
-  const existing = await getAccountByProviderEmail(env.DB, provider, email);
   if (!existing) return null;
   const credentials = await decryptCredentials(existing.encryptedCredentials, env.TOKEN_ENCRYPTION_KEY);
   return credentials.kind === "oauth" ? credentials.refreshToken : null;
@@ -308,9 +306,10 @@ export async function completeOAuthCallback(
   }
 
   const email = await fetchProfileEmail(provider, token.access_token);
+  const existing = await getAccountByProviderEmail(env.DB, definition.accountProvider, email);
   const refreshToken = typeof token.refresh_token === "string" && token.refresh_token
     ? token.refresh_token
-    : await existingRefreshToken(env, definition.accountProvider, email);
+    : await existingRefreshToken(env, existing);
   if (!refreshToken) {
     throw new MailMeshError(
       "oauth_refresh_token_missing",
@@ -337,9 +336,9 @@ export async function completeOAuthCallback(
   const account = await upsertAccount(env.DB, {
     provider: definition.accountProvider,
     email,
-    label: savedState.label || email,
+    label: savedState.label || existing?.label || email,
     encryptedCredentials,
-    providerConfig: {},
+    providerConfig: existing?.providerConfig ?? {},
     scopes: scope,
     enabled: true,
   });

@@ -4,6 +4,10 @@ import { asMailMeshError } from "./errors";
 import { MailService } from "./mail-service";
 import type { DraftInput, Env } from "./types";
 
+export interface MailMeshCapabilities {
+  createDrafts: boolean;
+}
+
 const accountIdsSchema = z.array(z.string().min(1).max(128)).max(20).optional();
 const addressSchema = z.object({
   name: z.string().max(200).optional(),
@@ -31,7 +35,7 @@ async function toolResult<T extends object>(operation: () => Promise<T>) {
   }
 }
 
-export function createMailMeshServer(env: Env): McpServer {
+export function createMailMeshServer(env: Env, capabilities: MailMeshCapabilities): McpServer {
   const server = new McpServer(
     { name: "MailMesh", version: "0.1.0" },
     {
@@ -126,7 +130,7 @@ export function createMailMeshServer(env: Env): McpServer {
       toolResult(async () => ({ message: await mail.getMessage(account_id, message_id) })),
   );
 
-  if (env.WRITE_MODE === "drafts") {
+  if (env.WRITE_MODE === "drafts" && capabilities.createDrafts) {
     server.registerTool(
       "create_email_draft",
       {

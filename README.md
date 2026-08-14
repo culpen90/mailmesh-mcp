@@ -129,11 +129,17 @@ curl -X POST http://localhost:8787/admin/oauth/start \
 
 Open the returned `authorizationUrl` and complete consent.
 
-List or remove linked accounts:
+List, relabel, or remove linked accounts:
 
 ```bash
 curl -H "Authorization: Bearer YOUR_MAILMESH_TOKEN" \
   http://localhost:8787/admin/accounts
+
+curl -X PATCH \
+  -H "Authorization: Bearer YOUR_MAILMESH_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"label":"Personal Gmail"}' \
+  http://localhost:8787/admin/accounts/ACCOUNT_ID
 
 curl -X DELETE -H "Authorization: Bearer YOUR_MAILMESH_TOKEN" \
   http://localhost:8787/admin/accounts/ACCOUNT_ID
@@ -181,7 +187,7 @@ Use this remote MCP URL in ChatGPT or Claude:
 
 `https://mailmesh-mcp.culpen0-workers.workers.dev/mcp`
 
-Choose OAuth if the client asks for an authentication method. The client registers itself, opens the MailMesh consent page, and uses PKCE. Paste the private `MAILMESH_TOKEN` into that MailMesh page and approve read-only access. The token is sent only to your Worker in an authorization header; ChatGPT or Claude receives separate one-hour OAuth access tokens and a rotating refresh token.
+Choose OAuth if the client asks for an authentication method. The client registers itself, opens the MailMesh consent page, and uses PKCE. Paste the private `MAILMESH_TOKEN` into that MailMesh page and approve the disclosed MailMesh access. The token is sent only to your Worker in an authorization header; ChatGPT or Claude receives separate one-hour OAuth access tokens and a rotating refresh token.
 
 MailMesh's dynamic-registration policy accepts the official hosted callback domains used by ChatGPT/OpenAI and Claude. Other clients can continue using the private static bearer header.
 
@@ -246,7 +252,7 @@ This initializes a real Streamable HTTP MCP client, lists the tools, and invokes
 | `MAX_RESULTS_PER_QUERY` | no | Defaults to 30, capped at 50 |
 | `MAX_MESSAGE_BYTES` | no | Defaults to 262,144 bytes, capped at 1 MiB |
 
-Switching `WRITE_MODE` from `read-only` to `drafts` changes the OAuth scopes. Re-link Gmail and Microsoft accounts after changing it. MailMesh does not expose a send tool in either mode.
+Switching `WRITE_MODE` from `read-only` to `drafts` changes the provider scopes and MCP grant capabilities. Re-link Gmail and Microsoft accounts, then reconnect each OAuth MCP client after changing it. MailMesh does not expose a send tool in either mode.
 
 ## Security notes
 
@@ -255,7 +261,7 @@ Switching `WRITE_MODE` from `read-only` to `drafts` changes the OAuth scopes. Re
 - Gmail/Microsoft and MCP consent state is single-use and expires after ten minutes. MCP OAuth access tokens, refresh tokens, authorization codes, and client secrets are stored in KV only as hashes; grant props are encrypted by the OAuth provider.
 - MCP OAuth uses authorization code flow with PKCE S256, an exact `/mcp` resource audience, one-hour access tokens, and 30-day rotating refresh tokens. Registered ChatGPT and Claude clients do not silently expire.
 - Dynamic registration and consent creation share a ten-request-per-minute Cloudflare rate limit and registration bodies are capped at 16 KiB.
-- MCP OAuth tokens have only `mail:read` access and cannot use `/admin`, add/remove accounts, or start a Gmail connection. The server remains deployed with `WRITE_MODE=read-only`.
+- MCP OAuth tokens require `mail:read` and cannot use `/admin`, add/remove accounts, or start a Gmail connection. The canonical server is deployed with `WRITE_MODE=drafts`; draft creation additionally requires an MCP grant approved in draft mode and a linked Gmail or Microsoft account authorized with the corresponding compose scope. Older read-only MCP grants stay read-only.
 - IMAP passwords are more sensitive than scoped OAuth tokens. Prefer app passwords and revoke them when removing MailMesh.
 - Message bodies and attachments are not stored. Attachment content is not exposed to the LLM.
-- The server creates no drafts unless `WRITE_MODE=drafts`, and it never sends, deletes, moves, or marks messages read.
+- The server creates no drafts unless the deployment mode, MCP grant, and linked provider account all allow it. It never sends, deletes, moves, or marks messages read.
