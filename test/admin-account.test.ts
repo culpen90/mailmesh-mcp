@@ -33,6 +33,7 @@ function env(): Env {
 function account(label = "Personal Gmail"): AccountRecord {
   return {
     id: "gmail-account",
+    userId: "mailmesh-owner",
     provider: "gmail",
     email: "person@example.com",
     label,
@@ -65,7 +66,12 @@ describe("account label administration", () => {
 
     expect(response?.status).toBe(200);
     expect(body.account).toMatchObject({ id: "gmail-account", label: "Personal Gmail" });
-    expect(updateAccountLabelMock).toHaveBeenCalledWith(expect.anything(), "gmail-account", "Personal Gmail");
+    expect(updateAccountLabelMock).toHaveBeenCalledWith(
+      expect.anything(),
+      "mailmesh-owner",
+      "gmail-account",
+      "Personal Gmail",
+    );
   });
 
   it("rejects empty labels without touching the database", async () => {

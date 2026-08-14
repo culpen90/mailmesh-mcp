@@ -5,8 +5,10 @@ import type {
   ClientRegistrationCallbackResult,
   OAuthHelpers,
 } from "@cloudflare/workers-oauth-provider";
-import { constantTimeEqual, hasValidBearerToken, randomBase64Url } from "./crypto";
+import { constantTimeEqual, randomBase64Url } from "./crypto";
+import { MailMeshError } from "./errors";
 import type { Env } from "./types";
+import { authenticateUserOrLegacyOwner } from "./user-auth";
 import { jsonResponse } from "./utils/http";
 
 export const MAIL_READ_SCOPE = "mail:read";
@@ -20,7 +22,6 @@ const PKCE_CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
 const CONSENT_ID = /^[A-Za-z0-9_-]{32,128}$/;
 const MAX_CONSENT_BODY_BYTES = 4_096;
 const MAX_REGISTRATION_BODY_BYTES = 16_384;
-const OAUTH_FLOW_RATE_KEY = "mailmesh:oauth-flow";
 
 interface StoredConsent {
   request: AuthRequest;
@@ -37,7 +38,15 @@ interface ConsentSubmission {
 
 type OAuthEnv = Pick<
   Env,
-  "MAILMESH_TOKEN" | "OAUTH_FLOW_RATE_LIMITER" | "OAUTH_KV" | "OAUTH_PROVIDER" | "PUBLIC_BASE_URL" | "WRITE_MODE"
+  | "AUTH_RATE_LIMITER"
+  | "DB"
+  | "MAILMESH_TOKEN"
+  | "OAUTH_FLOW_RATE_LIMITER"
+  | "OAUTH_KV"
+  | "OAUTH_PROVIDER"
+  | "PUBLIC_BASE_URL"
+  | "TOKEN_ENCRYPTION_KEY"
+  | "WRITE_MODE"
 >;
 
 export function canonicalPublicBaseUrl(env: Pick<Env, "PUBLIC_BASE_URL">): string {
@@ -93,6 +102,10 @@ function csrfCookie(value: string, maxAge: number): string {
 
 function clearCsrfCookie(): string {
   return csrfCookie("", 0);
+}
+
+function oauthFlowRateKey(request: Request, operation: "authorize" | "register"): string {
+  return `${operation}:${request.headers.get("cf-connecting-ip") ?? "unknown"}`;
 }
 
 function oauthError(message: string, status = 400, clearCookie = false): Response {
@@ -231,19 +244,22 @@ function consentPage(
     <form id="consent-form" autocomplete="off">
       <input id="consent-id" type="hidden" value="${htmlEscape(consentId)}">
       <input id="csrf-token" type="hidden" value="${htmlEscape(csrfToken)}">
-      <label for="token">MailMesh access token — not your Gmail password</label>
-      <input id="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false">
+      <label for="username">MailMesh username</label>
+      <input id="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false">
+      <label for="password">MailMesh password — not your email password</label>
+      <input id="password" type="password" autocomplete="current-password">
       <div class="actions">
         <button type="submit" name="decision" value="deny">Cancel</button>
         <button type="submit" name="decision" value="approve">${approvalLabel}</button>
       </div>
     </form>
-    <p class="note">The app never receives this permanent token. MailMesh uses it only to confirm that you are the owner, then issues separate short-lived OAuth credentials.</p>
+    <p class="note">The app never receives your MailMesh password. MailMesh verifies it here, then issues separate short-lived OAuth credentials scoped to your user.</p>
     <div id="status" class="alert" role="alert" hidden></div>
   </main>
   <script nonce="${nonce}">
     const form = document.getElementById("consent-form");
-    const tokenInput = document.getElementById("token");
+    const usernameInput = document.getElementById("username");
+    const passwordInput = document.getElementById("password");
     const statusBox = document.getElementById("status");
     const expectedRedirect = new URL(${scriptJson(authRequest.redirectUri)});
 
@@ -252,21 +268,29 @@ function consentPage(
       statusBox.hidden = false;
     }
 
+    function basicAuthorization(username, password) {
+      const bytes = new TextEncoder().encode(username + ":" + password);
+      let binary = "";
+      bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+      return "Basic " + btoa(binary);
+    }
+
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       statusBox.hidden = true;
       const decision = event.submitter && event.submitter.value === "deny" ? "deny" : "approve";
-      let token = tokenInput.value;
-      if (decision === "approve" && !token) {
-        showError("Enter your MailMesh access token.");
+      let username = usernameInput.value.trim();
+      let password = passwordInput.value;
+      if (decision === "approve" && (!username || !password)) {
+        showError("Enter your MailMesh username and password.");
         return;
       }
 
       const buttons = [...form.querySelectorAll("button")];
       buttons.forEach((button) => { button.disabled = true; });
-      tokenInput.value = "";
+      passwordInput.value = "";
       const headers = { "content-type": "application/json" };
-      if (decision === "approve") headers.authorization = "Bearer " + token;
+      if (decision === "approve") headers.authorization = basicAuthorization(username, password);
 
       try {
         const response = await fetch("/authorize", {
@@ -297,15 +321,17 @@ function consentPage(
           destination.hash !== ""
         ) throw new Error("invalid_destination");
 
-        token = "";
+        username = "";
+        password = "";
         location.replace(destination.href);
       } catch (error) {
         showError(error instanceof Error && error.message === "unauthorized"
-          ? "The MailMesh access token was not accepted. Start the connection again and retry."
+          ? "The MailMesh username or password was not accepted. Start the connection again and retry."
           : "MailMesh could not finish authorization. Return to the app and try connecting again.");
       } finally {
-        token = "";
-        tokenInput.value = "";
+        username = "";
+        password = "";
+        passwordInput.value = "";
         buttons.forEach((button) => { button.disabled = false; });
       }
     });
@@ -345,14 +371,14 @@ async function readConsentSubmission(request: Request): Promise<ConsentSubmissio
 function deniedRedirect(request: AuthRequest): string {
   const destination = new URL(request.redirectUri);
   destination.searchParams.set("error", "access_denied");
-  destination.searchParams.set("error_description", "The MailMesh owner denied access");
+  destination.searchParams.set("error_description", "The MailMesh user denied access");
   destination.searchParams.set("state", request.state);
   return destination.toString();
 }
 
 async function showConsent(request: Request, env: OAuthEnv, helpers: OAuthHelpers): Promise<Response> {
   try {
-    const rateLimit = await env.OAUTH_FLOW_RATE_LIMITER.limit({ key: OAUTH_FLOW_RATE_KEY });
+    const rateLimit = await env.OAUTH_FLOW_RATE_LIMITER.limit({ key: oauthFlowRateKey(request, "authorize") });
     if (!rateLimit.success) return authorizationErrorPage(429);
 
     const authRequest = await helpers.parseAuthRequest(request);
@@ -413,21 +439,29 @@ async function finishConsent(request: Request, env: OAuthEnv, helpers: OAuthHelp
       return jsonResponse({ redirectTo: deniedRedirect(stored.request) }, 200, { "set-cookie": clearCsrfCookie() });
     }
 
-    if (!(await hasValidBearerToken(request, env.MAILMESH_TOKEN))) {
-      return oauthError("The MailMesh access token was not accepted", 401, true);
+    let user;
+    try {
+      user = await authenticateUserOrLegacyOwner(request, env);
+    } catch (error) {
+      if (error instanceof MailMeshError && error.status === 429) {
+        return oauthError(error.message, 429, true);
+      }
+      return oauthError("The MailMesh username or password was not accepted", 401, true);
     }
 
     const client = await helpers.lookupClient(stored.request.clientId);
     if (!client) return oauthError("The OAuth client no longer exists", 400, true);
     const { redirectTo } = await helpers.completeAuthorization({
       request: stored.request,
-      userId: "mailmesh-owner",
+      userId: user.id,
       metadata: { kind: "mailmesh-mcp", authorizedAt: new Date().toISOString() },
       scope: stored.scopes,
       props: {
-        principal: "mailmesh-owner",
+        principal: `user:${user.id}`,
         authType: "oauth",
         scopes: stored.scopes,
+        userId: user.id,
+        authVersion: user.authVersion,
         canCreateDrafts: stored.canCreateDrafts,
       },
     });
@@ -509,7 +543,7 @@ export async function guardMcpClientRegistrationRequest(request: Request, env: O
     );
   }
 
-  const rateLimit = await env.OAUTH_FLOW_RATE_LIMITER.limit({ key: OAUTH_FLOW_RATE_KEY });
+  const rateLimit = await env.OAUTH_FLOW_RATE_LIMITER.limit({ key: oauthFlowRateKey(request, "register") });
   if (!rateLimit.success) {
     return jsonResponse(
       { error: "temporarily_unavailable", error_description: "OAuth setup is temporarily rate limited" },

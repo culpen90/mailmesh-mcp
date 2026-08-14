@@ -19,7 +19,7 @@ function env(writeMode: Env["WRITE_MODE"] = "drafts"): Env {
 }
 
 async function toolNames(writeMode: Env["WRITE_MODE"], capabilities: MailMeshCapabilities): Promise<string[]> {
-  const server = createMailMeshServer(env(writeMode), capabilities);
+  const server = createMailMeshServer(env(writeMode), "mailmesh-owner", capabilities);
   const client = new Client({ name: "mailmesh-test", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 

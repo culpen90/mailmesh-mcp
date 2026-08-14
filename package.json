@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A single-user Cloudflare Workers MCP server that unifies multiple email accounts.",
+  "description": "A tenant-isolated Cloudflare Workers MCP server that gives each user their own linked email accounts.",
   "scripts": {
     "build": "wrangler deploy --dry-run --outdir dist",
     "check": "npm run typecheck && npm test && npm run build",
@@ -15,6 +15,7 @@
     "oauth-smoke": "node scripts/oauth-smoke.mjs",
     "smoke": "node scripts/smoke.mjs",
     "test": "vitest run",
+    "test:migrations": "vitest run test/migrations.test.ts",
     "test:watch": "vitest",
     "typecheck": "wrangler types --check && tsc --noEmit"
   },

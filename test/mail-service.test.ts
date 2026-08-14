@@ -19,4 +19,12 @@ describe("MailService search cursor binding", () => {
     expect(excluded).toBe(omitted);
     expect(included).not.toBe(omitted);
   });
+
+  it("binds cursor fingerprints to the authenticated MailMesh user", async () => {
+    const filters = { query: "quarterly report" };
+    const accountIds = ["shared-looking-account-id"];
+    const userA = await searchFingerprint(filters, accountIds, 20, "user-a");
+    const userB = await searchFingerprint(filters, accountIds, 20, "user-b");
+    expect(userA).not.toBe(userB);
+  });
 });

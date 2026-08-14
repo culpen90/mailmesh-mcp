@@ -5,6 +5,7 @@ describe("account label persistence", () => {
   it("binds a normalized label and returns the updated account", async () => {
     const storedRow = {
       id: "gmail-account",
+      user_id: "user-a",
       provider: "gmail",
       email: "person@example.com",
       label: "Personal Gmail",
@@ -21,12 +22,13 @@ describe("account label persistence", () => {
     const prepare = vi.fn(() => ({ bind }));
     const result = await updateAccountLabel(
       { prepare } as unknown as D1Database,
+      "user-a",
       "gmail-account",
       "  Personal Gmail  ",
     );
 
     expect(prepare).toHaveBeenCalledWith(expect.stringContaining("UPDATE email_accounts"));
-    expect(bind).toHaveBeenCalledWith("gmail-account", "Personal Gmail", expect.any(String));
+    expect(bind).toHaveBeenCalledWith("user-a", "gmail-account", "Personal Gmail", expect.any(String));
     expect(result).toMatchObject({ id: "gmail-account", label: "Personal Gmail" });
   });
 
@@ -34,6 +36,7 @@ describe("account label persistence", () => {
     const prepare = vi.fn();
     await expect(updateAccountLabel(
       { prepare } as unknown as D1Database,
+      "user-a",
       "gmail-account",
       label,
     )).rejects.toMatchObject({ code: "invalid_label", status: 400 });
