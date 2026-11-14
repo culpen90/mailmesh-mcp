@@ -1,5 +1,6 @@
 import { OAuthError, OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp";
+import { version } from "../package.json";
 import { handleAdminRequest } from "./admin";
 import { constantTimeEqual } from "./crypto";
 import { getMcpAuthorization } from "./db";
@@ -118,7 +119,7 @@ const applicationHandler = {
     if (url.pathname === "/" && (request.method === "GET" || request.method === "HEAD")) {
       const response = jsonResponse({
         name: "MailMesh MCP",
-        version: "0.1.0",
+        version,
         mcp: "/mcp",
         authorization: "OAuth 2.1 with PKCE",
         health: "/health",

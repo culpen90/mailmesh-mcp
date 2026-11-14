@@ -1,3 +1,4 @@
+import { version } from "../package.json";
 import { getMcpAuthorization } from "./db";
 import type { Env } from "./types";
 import { jsonResponse } from "./utils/http";
@@ -8,7 +9,7 @@ export async function health(env: Env): Promise<Response> {
     return jsonResponse({
       ok: true,
       service: "mailmesh-mcp",
-      version: "0.1.0",
+      version,
       database: "ready",
       schema: "ready",
     });
@@ -16,7 +17,7 @@ export async function health(env: Env): Promise<Response> {
     return jsonResponse({
       ok: false,
       service: "mailmesh-mcp",
-      version: "0.1.0",
+      version,
       database: "unavailable",
       schema: "unavailable",
     }, 503);
