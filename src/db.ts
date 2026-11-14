@@ -1,18 +1,17 @@
 import { sha256Base64Url } from "./crypto";
 import { MailMeshError } from "./errors";
-import type {
-  AccountRecord,
-  EmailProvider,
-  PublicAccount,
-  PublicUser,
-  UserRecord,
-} from "./types";
+import {
+  MCP_GRANT_ID_PATTERN,
+  MCP_GRANT_REVOCATION_RETENTION_SECONDS,
+} from "./mcp-oauth-policy";
+import type { AccountRecord, EmailProvider, PublicAccount } from "./types";
 
-export const LEGACY_OWNER_USER_ID = "mailmesh-owner";
+// The old schema also has email_accounts and oauth_states. Require the workspace
+// schema before using statements that would otherwise match any tenant's row.
+const WORKSPACE_READY = "EXISTS (SELECT 1 FROM mcp_workspace WHERE id = 1)";
 
 interface AccountRow {
   id: string;
-  user_id: string;
   provider: string;
   email: string;
   label: string;
@@ -25,22 +24,7 @@ interface AccountRow {
   last_error: string | null;
 }
 
-interface UserRow {
-  id: string;
-  username: string;
-  display_name: string;
-  password_algorithm: string;
-  password_hash: string;
-  password_salt: string;
-  password_iterations: number;
-  auth_version: number;
-  enabled: number;
-  created_at: string;
-  updated_at: string;
-}
-
 interface OAuthStateRow {
-  user_id: string;
   provider: string;
   label: string;
   code_verifier: string;
@@ -48,31 +32,8 @@ interface OAuthStateRow {
   created_at: string;
 }
 
-export interface PasswordData {
-  algorithm: "pbkdf2-sha256-hmac-pepper-v1";
-  hash: string;
-  salt: string;
-  iterations: number;
-}
-
-export interface UserWrite {
-  id?: string;
-  username: string;
-  displayName: string;
-  password: PasswordData;
-  enabled?: boolean;
-}
-
-export interface UserUpdate {
-  username?: string;
-  displayName?: string;
-  password?: PasswordData;
-  enabled?: boolean;
-}
-
 export interface AccountWrite {
   id?: string;
-  userId: string;
   provider: EmailProvider;
   email: string;
   label: string;
@@ -83,7 +44,6 @@ export interface AccountWrite {
 }
 
 export interface OAuthStateRecord {
-  userId: string;
   provider: "gmail" | "microsoft";
   label: string;
   codeVerifier: string;
@@ -93,7 +53,6 @@ export interface OAuthStateRecord {
 
 export interface CreateOAuthStateInput {
   state: string;
-  userId: string;
   provider: "gmail" | "microsoft";
   label: string;
   codeVerifier: string;
@@ -120,7 +79,6 @@ function parseProviderConfig(value: string): Record<string, unknown> {
 function mapAccountRow(row: AccountRow): AccountRecord {
   return {
     id: row.id,
-    userId: row.user_id,
     provider: parseProvider(row.provider),
     email: row.email,
     label: row.label,
@@ -131,22 +89,6 @@ function mapAccountRow(row: AccountRow): AccountRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     lastError: row.last_error,
-  };
-}
-
-function mapUserRow(row: UserRow): UserRecord {
-  return {
-    id: row.id,
-    username: row.username,
-    displayName: row.display_name,
-    passwordAlgorithm: row.password_algorithm,
-    passwordHash: row.password_hash,
-    passwordSalt: row.password_salt,
-    passwordIterations: row.password_iterations,
-    authVersion: row.auth_version,
-    enabled: Boolean(row.enabled),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
   };
 }
 
@@ -164,156 +106,15 @@ export function toPublicAccount(account: AccountRecord): PublicAccount {
   };
 }
 
-export function toPublicUser(user: UserRecord): PublicUser {
-  return {
-    id: user.id,
-    username: user.username,
-    displayName: user.displayName,
-    enabled: user.enabled,
-    passwordConfigured: Boolean(
-      user.passwordAlgorithm === "pbkdf2-sha256-hmac-pepper-v1" &&
-      user.passwordHash &&
-      user.passwordSalt &&
-      user.passwordIterations === 50_000
-    ),
-    authVersion: user.authVersion,
-    createdAt: user.createdAt,
-    updatedAt: user.updatedAt,
-  };
-}
-
-export function normalizeUsername(value: string): string {
-  const username = value.trim().toLowerCase();
-  if (username.length < 3 || username.length > 64 || !/^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/.test(username)) {
-    throw new MailMeshError(
-      "invalid_username",
-      "Username must be 3-64 lowercase letters, numbers, dots, underscores, or hyphens",
-      400,
-    );
-  }
-  return username;
-}
-
-function normalizeDisplayName(value: string): string {
-  const displayName = value.trim();
-  if (!displayName || displayName.length > 100) {
-    throw new MailMeshError("invalid_display_name", "Display name must be between 1 and 100 characters", 400);
-  }
-  return displayName;
-}
-
-function validatePasswordData(value: PasswordData): PasswordData {
-  if (
-    value.algorithm !== "pbkdf2-sha256-hmac-pepper-v1" ||
-    !value.hash ||
-    !value.salt ||
-    value.iterations !== 50_000
-  ) {
-    throw new MailMeshError("invalid_password", "Password data is invalid", 400);
-  }
-  return value;
-}
-
-export async function listUsers(db: D1Database): Promise<UserRecord[]> {
-  const result = await db.prepare(
-    "SELECT * FROM mailmesh_users ORDER BY display_name COLLATE NOCASE, username COLLATE NOCASE",
-  ).all<UserRow>();
-  return result.results.map(mapUserRow);
-}
-
-export async function getUserById(db: D1Database, userId: string): Promise<UserRecord | null> {
-  const row = await db.prepare("SELECT * FROM mailmesh_users WHERE id = ?1").bind(userId).first<UserRow>();
-  return row ? mapUserRow(row) : null;
-}
-
-export async function getUserByUsername(db: D1Database, username: string): Promise<UserRecord | null> {
-  const normalized = username.trim().toLowerCase();
-  const row = await db.prepare(
-    "SELECT * FROM mailmesh_users WHERE username = ?1 COLLATE NOCASE",
-  ).bind(normalized).first<UserRow>();
-  return row ? mapUserRow(row) : null;
-}
-
-export async function createUser(db: D1Database, input: UserWrite): Promise<UserRecord> {
-  const id = input.id ?? crypto.randomUUID();
-  const username = normalizeUsername(input.username);
-  const displayName = normalizeDisplayName(input.displayName);
-  const password = validatePasswordData(input.password);
-  if (await getUserByUsername(db, username)) {
-    throw new MailMeshError("username_taken", "That username is already in use", 409);
-  }
-  const now = new Date().toISOString();
-  const row = await db.prepare(
-    `INSERT INTO mailmesh_users (
-       id, username, display_name, password_algorithm, password_hash, password_salt,
-       password_iterations, auth_version, enabled, created_at, updated_at
-     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?9)
-     RETURNING *`,
-  ).bind(
-    id,
-    username,
-    displayName,
-    password.algorithm,
-    password.hash,
-    password.salt,
-    password.iterations,
-    input.enabled === false ? 0 : 1,
-    now,
-  ).first<UserRow>();
-  if (!row) throw new MailMeshError("database_error", "The user could not be created", 500);
-  return mapUserRow(row);
-}
-
-export async function updateUser(db: D1Database, userId: string, input: UserUpdate): Promise<UserRecord | null> {
-  const existing = await getUserById(db, userId);
-  if (!existing) return null;
-  const username = input.username === undefined ? existing.username : normalizeUsername(input.username);
-  const displayName = input.displayName === undefined ? existing.displayName : normalizeDisplayName(input.displayName);
-  const duplicate = await getUserByUsername(db, username);
-  if (duplicate && duplicate.id !== userId) {
-    throw new MailMeshError("username_taken", "That username is already in use", 409);
-  }
-  const password = input.password === undefined
-    ? {
-        algorithm: existing.passwordAlgorithm as PasswordData["algorithm"],
-        hash: existing.passwordHash,
-        salt: existing.passwordSalt,
-        iterations: existing.passwordIterations,
-      }
-    : validatePasswordData(input.password);
-  const row = await db.prepare(
-    `UPDATE mailmesh_users
-     SET username = ?2, display_name = ?3, password_algorithm = ?4, password_hash = ?5,
-         password_salt = ?6, password_iterations = ?7,
-         auth_version = auth_version + ?8, enabled = ?9, updated_at = ?10
-     WHERE id = ?1
-     RETURNING *`,
-  ).bind(
-    userId,
-    username,
-    displayName,
-    password.algorithm,
-    password.hash,
-    password.salt,
-    password.iterations,
-    input.password === undefined && input.enabled === undefined ? 0 : 1,
-    input.enabled === undefined ? (existing.enabled ? 1 : 0) : (input.enabled ? 1 : 0),
-    new Date().toISOString(),
-  ).first<UserRow>();
-  return row ? mapUserRow(row) : null;
-}
-
 function normalizeAccountWrite(input: AccountWrite): Required<AccountWrite> {
-  const userId = input.userId.trim();
   const email = input.email.trim().toLowerCase();
   const label = input.label.trim() || email;
-  if (!userId || !email || !input.encryptedCredentials) {
-    throw new MailMeshError("invalid_account", "Account owner, email, and credentials are required", 400);
+  if (!email || !input.encryptedCredentials) {
+    throw new MailMeshError("invalid_account", "Account email and credentials are required", 400);
   }
 
   return {
     id: input.id ?? crypto.randomUUID(),
-    userId,
     provider: input.provider,
     email,
     label,
@@ -324,76 +125,148 @@ function normalizeAccountWrite(input: AccountWrite): Required<AccountWrite> {
   };
 }
 
-export async function listAccounts(db: D1Database, userId: string, enabledOnly = false): Promise<AccountRecord[]> {
+/** Invalidate every existing OAuth grant with one atomic update. */
+export async function incrementMcpAuthVersion(db: D1Database): Promise<number> {
+  const version = await db.prepare(
+    "UPDATE mcp_workspace SET auth_version = auth_version + 1 WHERE id = 1 RETURNING auth_version",
+  ).first<number>("auth_version");
+  if (version === null) throw new MailMeshError("database_error", "The MailMesh workspace is unavailable", 503);
+  return version;
+}
+
+/** Load the current workspace version and targeted-grant cutoff in one D1 read. */
+export async function getMcpAuthorization(
+  db: D1Database,
+  grantId?: string,
+  now = new Date(),
+): Promise<{ authVersion: number; grantRevoked: boolean }> {
+  const row = await db.prepare(
+    `SELECT auth_version,
+            EXISTS (
+              SELECT 1 FROM mcp_grant_revocations WHERE grant_id = ?1 AND expires_at > ?2
+            ) AS grant_revoked
+     FROM mcp_workspace WHERE id = 1`,
+  ).bind(grantId ?? null, now.toISOString()).first<{ auth_version: number; grant_revoked: number }>();
+  if (!row || !Number.isSafeInteger(row.auth_version) || row.auth_version < 1) {
+    throw new MailMeshError("database_error", "The MailMesh workspace is unavailable", 503);
+  }
+  return { authVersion: row.auth_version, grantRevoked: row.grant_revoked === 1 };
+}
+
+export async function listRevokedMcpGrantIds(
+  db: D1Database,
+  grantIds: readonly string[],
+  now = new Date(),
+): Promise<Set<string>> {
+  const uniqueGrantIds = [...new Set(grantIds.filter((grantId) => MCP_GRANT_ID_PATTERN.test(grantId)))];
+  if (uniqueGrantIds.length === 0) return new Set();
+  const placeholders = uniqueGrantIds.map((_, index) => `?${index + 2}`).join(", ");
+  const rows = await db.prepare(
+    `SELECT grant_id FROM mcp_grant_revocations
+     WHERE expires_at > ?1 AND grant_id IN (${placeholders}) AND ${WORKSPACE_READY}`,
+  ).bind(now.toISOString(), ...uniqueGrantIds).all<{ grant_id: string }>();
+  return new Set(rows.results.map((row) => row.grant_id));
+}
+
+/** Record an idempotent D1 tombstone before attempting distributed KV cleanup. */
+export async function recordMcpGrantRevocation(
+  db: D1Database,
+  grantId: string,
+  now = new Date(),
+): Promise<void> {
+  if (!MCP_GRANT_ID_PATTERN.test(grantId)) {
+    throw new MailMeshError("invalid_request", "MCP connection ID is invalid", 400);
+  }
+  const revokedAt = now.toISOString();
+  const expiresAt = new Date(now.getTime() + MCP_GRANT_REVOCATION_RETENTION_SECONDS * 1_000).toISOString();
+  await db.prepare(
+    `DELETE FROM mcp_grant_revocations WHERE expires_at <= ?1 AND ${WORKSPACE_READY}`,
+  ).bind(revokedAt).run();
+
+  const row = await db.prepare(
+    `INSERT INTO mcp_grant_revocations (grant_id, revoked_at, expires_at)
+     SELECT ?1, ?2, ?3
+     FROM mcp_workspace
+     WHERE id = 1
+     ON CONFLICT (grant_id) DO UPDATE SET
+       revoked_at = excluded.revoked_at,
+       expires_at = excluded.expires_at
+     RETURNING grant_id`,
+  ).bind(grantId, revokedAt, expiresAt).first<{ grant_id: string }>();
+  if (!row) throw new MailMeshError("database_error", "The MailMesh workspace is unavailable", 503);
+}
+
+export async function listAccounts(db: D1Database, enabledOnly = false): Promise<AccountRecord[]> {
   const query = enabledOnly
-    ? "SELECT * FROM email_accounts WHERE user_id = ?1 AND enabled = 1 ORDER BY label COLLATE NOCASE, email COLLATE NOCASE"
-    : "SELECT * FROM email_accounts WHERE user_id = ?1 ORDER BY label COLLATE NOCASE, email COLLATE NOCASE";
-  const result = await db.prepare(query).bind(userId).all<AccountRow>();
+    ? `SELECT * FROM email_accounts WHERE enabled = 1 AND ${WORKSPACE_READY} ORDER BY label COLLATE NOCASE, email COLLATE NOCASE`
+    : `SELECT * FROM email_accounts WHERE ${WORKSPACE_READY} ORDER BY label COLLATE NOCASE, email COLLATE NOCASE`;
+  const result = await db.prepare(query).all<AccountRow>();
   return result.results.map(mapAccountRow);
 }
 
-export async function getAccount(db: D1Database, userId: string, accountId: string): Promise<AccountRecord | null> {
-  const row = await db.prepare(
-    "SELECT * FROM email_accounts WHERE user_id = ?1 AND id = ?2",
-  ).bind(userId, accountId).first<AccountRow>();
+export async function getAccount(db: D1Database, accountId: string): Promise<AccountRecord | null> {
+  const row = await db.prepare(`SELECT * FROM email_accounts WHERE id = ?1 AND ${WORKSPACE_READY}`)
+    .bind(accountId).first<AccountRow>();
   return row ? mapAccountRow(row) : null;
 }
 
 export async function getAccountByProviderEmail(
   db: D1Database,
-  userId: string,
   provider: EmailProvider,
   email: string,
 ): Promise<AccountRecord | null> {
-  const row = await db.prepare(
-    "SELECT * FROM email_accounts WHERE user_id = ?1 AND provider = ?2 AND email = ?3",
-  ).bind(userId, provider, email.trim().toLowerCase()).first<AccountRow>();
+  const row = await db
+    .prepare(`SELECT * FROM email_accounts WHERE provider = ?1 AND email = ?2 AND ${WORKSPACE_READY}`)
+    .bind(provider, email.trim().toLowerCase())
+    .first<AccountRow>();
   return row ? mapAccountRow(row) : null;
-}
-
-function normalizedLabel(label: string): string {
-  const normalized = label.trim();
-  if (!normalized || normalized.length > 100) {
-    throw new MailMeshError("invalid_label", "Account label must be between 1 and 100 characters", 400);
-  }
-  return normalized;
 }
 
 export async function updateAccountLabel(
   db: D1Database,
-  userId: string,
   accountId: string,
   label: string,
 ): Promise<AccountRecord | null> {
-  const value = normalizedLabel(label);
-  const row = await db.prepare(
-    `UPDATE email_accounts SET label = ?3, updated_at = ?4
-     WHERE user_id = ?1 AND id = ?2 RETURNING *`,
-  ).bind(userId, accountId, value, new Date().toISOString()).first<AccountRow>();
+  const normalized = label.trim();
+  if (!normalized || normalized.length > 100) {
+    throw new MailMeshError("invalid_label", "Account label must be between 1 and 100 characters", 400);
+  }
+  const row = await db
+    .prepare(
+      `UPDATE email_accounts
+       SET label = ?2, updated_at = ?3
+       WHERE id = ?1 AND ${WORKSPACE_READY}
+       RETURNING *`,
+    )
+    .bind(accountId, normalized, new Date().toISOString())
+    .first<AccountRow>();
   return row ? mapAccountRow(row) : null;
 }
 
 export async function createAccount(db: D1Database, input: AccountWrite): Promise<AccountRecord> {
   const account = normalizeAccountWrite(input);
   const now = new Date().toISOString();
-  const row = await db.prepare(
-    `INSERT INTO email_accounts (
-       id, user_id, provider, email, label, encrypted_credentials, provider_config,
-       scopes, enabled, created_at, updated_at, last_error
-     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, NULL)
-     RETURNING *`,
-  ).bind(
-    account.id,
-    account.userId,
-    account.provider,
-    account.email,
-    account.label,
-    account.encryptedCredentials,
-    JSON.stringify(account.providerConfig),
-    account.scopes,
-    account.enabled ? 1 : 0,
-    now,
-  ).first<AccountRow>();
+  const row = await db
+    .prepare(
+      `INSERT INTO email_accounts (
+         id, provider, email, label, encrypted_credentials, provider_config,
+         scopes, enabled, created_at, updated_at, last_error
+       ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, NULL
+       FROM mcp_workspace WHERE id = 1
+       RETURNING *`,
+    )
+    .bind(
+      account.id,
+      account.provider,
+      account.email,
+      account.label,
+      account.encryptedCredentials,
+      JSON.stringify(account.providerConfig),
+      account.scopes,
+      account.enabled ? 1 : 0,
+      now,
+    )
+    .first<AccountRow>();
 
   if (!row) throw new MailMeshError("database_error", "The account could not be created", 500);
   return mapAccountRow(row);
@@ -402,32 +275,35 @@ export async function createAccount(db: D1Database, input: AccountWrite): Promis
 export async function upsertAccount(db: D1Database, input: AccountWrite): Promise<AccountRecord> {
   const account = normalizeAccountWrite(input);
   const now = new Date().toISOString();
-  const row = await db.prepare(
-    `INSERT INTO email_accounts (
-       id, user_id, provider, email, label, encrypted_credentials, provider_config,
-       scopes, enabled, created_at, updated_at, last_error
-     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, NULL)
-     ON CONFLICT(user_id, provider, email) DO UPDATE SET
-       label = excluded.label,
-       encrypted_credentials = excluded.encrypted_credentials,
-       provider_config = excluded.provider_config,
-       scopes = excluded.scopes,
-       enabled = excluded.enabled,
-       updated_at = excluded.updated_at,
-       last_error = NULL
-     RETURNING *`,
-  ).bind(
-    account.id,
-    account.userId,
-    account.provider,
-    account.email,
-    account.label,
-    account.encryptedCredentials,
-    JSON.stringify(account.providerConfig),
-    account.scopes,
-    account.enabled ? 1 : 0,
-    now,
-  ).first<AccountRow>();
+  const row = await db
+    .prepare(
+      `INSERT INTO email_accounts (
+         id, provider, email, label, encrypted_credentials, provider_config,
+         scopes, enabled, created_at, updated_at, last_error
+       ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, NULL
+       FROM mcp_workspace WHERE id = 1
+       ON CONFLICT(provider, email) DO UPDATE SET
+         label = excluded.label,
+         encrypted_credentials = excluded.encrypted_credentials,
+         provider_config = excluded.provider_config,
+         scopes = excluded.scopes,
+         enabled = excluded.enabled,
+         updated_at = excluded.updated_at,
+         last_error = NULL
+       RETURNING *`,
+    )
+    .bind(
+      account.id,
+      account.provider,
+      account.email,
+      account.label,
+      account.encryptedCredentials,
+      JSON.stringify(account.providerConfig),
+      account.scopes,
+      account.enabled ? 1 : 0,
+      now,
+    )
+    .first<AccountRow>();
 
   if (!row) throw new MailMeshError("database_error", "The account could not be saved", 500);
   return mapAccountRow(row);
@@ -435,49 +311,56 @@ export async function upsertAccount(db: D1Database, input: AccountWrite): Promis
 
 export async function updateAccountCredentials(
   db: D1Database,
-  userId: string,
   accountId: string,
   encryptedCredentials: string,
   scopes?: string,
 ): Promise<AccountRecord> {
   const now = new Date().toISOString();
   const row = scopes === undefined
-    ? await db.prepare(
-        `UPDATE email_accounts SET encrypted_credentials = ?3, updated_at = ?4, last_error = NULL
-         WHERE user_id = ?1 AND id = ?2 RETURNING *`,
-      ).bind(userId, accountId, encryptedCredentials, now).first<AccountRow>()
-    : await db.prepare(
-        `UPDATE email_accounts SET encrypted_credentials = ?3, scopes = ?4, updated_at = ?5, last_error = NULL
-         WHERE user_id = ?1 AND id = ?2 RETURNING *`,
-      ).bind(userId, accountId, encryptedCredentials, scopes.trim(), now).first<AccountRow>();
+    ? await db
+        .prepare(
+          `UPDATE email_accounts
+           SET encrypted_credentials = ?2, updated_at = ?3, last_error = NULL
+           WHERE id = ?1 AND ${WORKSPACE_READY}
+           RETURNING *`,
+        )
+        .bind(accountId, encryptedCredentials, now)
+        .first<AccountRow>()
+    : await db
+        .prepare(
+          `UPDATE email_accounts
+           SET encrypted_credentials = ?2, scopes = ?3, updated_at = ?4, last_error = NULL
+           WHERE id = ?1 AND ${WORKSPACE_READY}
+           RETURNING *`,
+        )
+        .bind(accountId, encryptedCredentials, scopes.trim(), now)
+        .first<AccountRow>();
 
   if (!row) throw new MailMeshError("account_not_found", "Account not found", 404, false, accountId);
   return mapAccountRow(row);
 }
 
-export async function deleteAccount(db: D1Database, userId: string, accountId: string): Promise<boolean> {
-  const result = await db.prepare(
-    "DELETE FROM email_accounts WHERE user_id = ?1 AND id = ?2",
-  ).bind(userId, accountId).run();
+export async function deleteAccount(db: D1Database, accountId: string): Promise<boolean> {
+  const result = await db.prepare(`DELETE FROM email_accounts WHERE id = ?1 AND ${WORKSPACE_READY}`)
+    .bind(accountId).run();
   return result.meta.changes > 0;
 }
 
 export async function createOAuthState(db: D1Database, input: CreateOAuthStateInput): Promise<void> {
   const stateHash = await sha256Base64Url(input.state);
   const now = new Date().toISOString();
-  await db.prepare(
-    `INSERT INTO oauth_states (
-       state_hash, user_id, provider, label, code_verifier, expires_at, created_at
-     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
-  ).bind(
-    stateHash,
-    input.userId,
-    input.provider,
-    input.label,
-    input.codeVerifier,
-    input.expiresAt,
-    now,
-  ).run();
+  const result = await db
+    .prepare(
+      `INSERT INTO oauth_states (
+         state_hash, provider, label, code_verifier, expires_at, created_at
+       ) SELECT ?1, ?2, ?3, ?4, ?5, ?6
+       FROM mcp_workspace WHERE id = 1`,
+    )
+    .bind(stateHash, input.provider, input.label, input.codeVerifier, input.expiresAt, now)
+    .run();
+  if (result.meta.changes !== 1) {
+    throw new MailMeshError("database_error", "The MailMesh workspace is unavailable", 503);
+  }
 }
 
 /** Atomically remove and return a valid OAuth state. A second use returns null. */
@@ -488,18 +371,20 @@ export async function consumeOAuthState(
 ): Promise<OAuthStateRecord | null> {
   const stateHash = await sha256Base64Url(state);
   const now = new Date().toISOString();
-  const row = await db.prepare(
-    `DELETE FROM oauth_states
-     WHERE state_hash = ?1 AND provider = ?2 AND expires_at > ?3
-     RETURNING user_id, provider, label, code_verifier, expires_at, created_at`,
-  ).bind(stateHash, provider, now).first<OAuthStateRow>();
+  const row = await db
+    .prepare(
+      `DELETE FROM oauth_states
+       WHERE state_hash = ?1 AND provider = ?2 AND expires_at > ?3 AND ${WORKSPACE_READY}
+       RETURNING provider, label, code_verifier, expires_at, created_at`,
+    )
+    .bind(stateHash, provider, now)
+    .first<OAuthStateRow>();
 
   if (!row) return null;
   if (row.provider !== "gmail" && row.provider !== "microsoft") {
     throw new MailMeshError("database_corruption", "An OAuth state has an invalid provider", 500);
   }
   return {
-    userId: row.user_id,
     provider: row.provider,
     label: row.label,
     codeVerifier: row.code_verifier,
@@ -509,7 +394,9 @@ export async function consumeOAuthState(
 }
 
 export async function deleteExpiredOAuthStates(db: D1Database): Promise<number> {
-  const result = await db.prepare("DELETE FROM oauth_states WHERE expires_at <= ?1")
-    .bind(new Date().toISOString()).run();
+  const result = await db
+    .prepare(`DELETE FROM oauth_states WHERE expires_at <= ?1 AND ${WORKSPACE_READY}`)
+    .bind(new Date().toISOString())
+    .run();
   return result.meta.changes;
 }

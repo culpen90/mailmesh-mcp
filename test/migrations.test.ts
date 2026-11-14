@@ -132,9 +132,9 @@ const legacyStateBytes = `
   ORDER BY state_hash
 `;
 
-describe("D1 multi-user migration", () => {
+describe("D1 workspace migration", () => {
   it(
-    "preserves legacy rows byte-for-byte and assigns them to the reserved owner",
+    "preserves mailbox bytes, refuses unsafe upgrades, and removes individual login data",
     async () => {
       const persistenceDirectory = await mkdtemp(join(tmpdir(), "mailmesh-d1-migration-"));
       const fixturePath = join(persistenceDirectory, "legacy-fixture.sql");
@@ -199,6 +199,7 @@ describe("D1 multi-user migration", () => {
         );
 
         await executeFile(persistenceDirectory, join(repositoryRoot, "migrations", "0002_multi_user.sql"));
+        await executeFile(persistenceDirectory, join(repositoryRoot, "migrations", "0003_mcp_grant_revocations.sql"));
 
         expect(await query(persistenceDirectory, legacyAccountBytes)).toEqual(accountsBefore);
         expect(await query(persistenceDirectory, legacyStateBytes)).toEqual(statesBefore);
@@ -259,7 +260,7 @@ describe("D1 multi-user migration", () => {
               provider_config, scopes, enabled, created_at, updated_at, last_error
             ) VALUES (
               'acct-tenant-b', 'tenant-b', 'gmail', 'Legacy+Gmail@Example.Test',
-              'Tenant B Gmail', 'v1.tenant-b.ciphertext', '{}', '', 1,
+              'Tenant B Gmail', 'v1.tenant-b.ciphertext', '{}', '', 0,
               '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', NULL
             );
             INSERT INTO oauth_states (
@@ -268,6 +269,16 @@ describe("D1 multi-user migration", () => {
               'state-tenant-b', 'tenant-b', 'gmail', 'Tenant B', 'verifier-tenant-b',
               '2026-01-01T00:10:00.000Z', '2026-01-01T00:00:00.000Z'
             );
+            INSERT INTO mcp_grant_revocations (user_id, grant_id, revoked_at, expires_at)
+            VALUES ('mailmesh-owner', 'past-owner-grant-id', '2026-01-01T00:00:00.000Z', '2026-01-31T00:00:00.000Z');
+
+            CREATE TABLE d1_migrations (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT UNIQUE,
+              applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+            );
+            INSERT INTO d1_migrations (name) VALUES
+              ('0001_initial.sql'), ('0002_multi_user.sql'), ('0003_mcp_grant_revocations.sql');
           `,
           "utf8",
         );
@@ -302,22 +313,56 @@ describe("D1 multi-user migration", () => {
           ),
         ).rejects.toThrow(/UNIQUE constraint failed/);
 
-        await executeCommand(persistenceDirectory, "DELETE FROM mailmesh_users WHERE id = 'tenant-b'");
+        const applyWorkspaceMigration = () => runWrangler([
+          "d1", "migrations", "apply", "mailmesh", "--local", "--persist-to", persistenceDirectory,
+        ]);
+        const migrationStatus = `
+          SELECT
+            (SELECT count(*) FROM d1_migrations WHERE name = '0004_workspace.sql') AS applied,
+            (SELECT count(*) FROM sqlite_master WHERE name = 'workspace_migration_guard') AS leftover_guard,
+            (SELECT count(*) FROM mailmesh_users) AS users,
+            (SELECT count(*) FROM email_accounts WHERE user_id = 'tenant-b') AS private_accounts
+        `;
+
+        await expect(applyWorkspaceMigration()).rejects.toThrow(/unlink_private_mailboxes_before_workspace_migration/);
+        expect(await query(persistenceDirectory, migrationStatus)).toEqual([
+          { applied: 0, leftover_guard: 0, users: 2, private_accounts: 1 },
+        ]);
+
+        await executeCommand(persistenceDirectory, `
+          DELETE FROM email_accounts WHERE user_id = 'tenant-b';
+          UPDATE mailmesh_users SET enabled = 0 WHERE id = 'mailmesh-owner';
+        `);
+        await expect(applyWorkspaceMigration()).rejects.toThrow(/review_disabled_owner_mailboxes_before_workspace_migration/);
+        expect(await query(persistenceDirectory, migrationStatus)).toEqual([
+          { applied: 0, leftover_guard: 0, users: 2, private_accounts: 0 },
+        ]);
+        expect(await query(persistenceDirectory, legacyAccountBytes)).toEqual(accountsBefore);
+
+        await executeCommand(persistenceDirectory, "UPDATE mailmesh_users SET enabled = 1 WHERE id = 'mailmesh-owner'");
+        await applyWorkspaceMigration();
+
+        expect(await query(persistenceDirectory, legacyAccountBytes)).toEqual(accountsBefore);
+        expect(await query(persistenceDirectory, legacyStateBytes)).toEqual([]);
         expect(
-          await query(
-            persistenceDirectory,
-            `
-              SELECT
-                (SELECT count(*) FROM email_accounts WHERE user_id = 'tenant-b') AS account_count,
-                (SELECT count(*) FROM oauth_states WHERE user_id = 'tenant-b') AS state_count
-            `,
-          ),
-        ).toEqual([{ account_count: 0, state_count: 0 }]);
+          await query(persistenceDirectory, "SELECT name FROM d1_migrations WHERE name = '0004_workspace.sql'"),
+        ).toEqual([{ name: "0004_workspace.sql" }]);
+        expect(await query(persistenceDirectory, "SELECT id, auth_version FROM mcp_workspace"))
+          .toEqual([{ id: 1, auth_version: 1 }]);
+        expect(await query(persistenceDirectory, "SELECT grant_id FROM mcp_grant_revocations")).toEqual([]);
+        expect(await query(persistenceDirectory, `
+          SELECT name FROM sqlite_master WHERE name IN ('mailmesh_users', 'workspace_migration_guard')
+        `)).toEqual([]);
+        expect(await query(persistenceDirectory, `
+          SELECT name FROM pragma_table_info('email_accounts') WHERE name = 'user_id'
+          UNION ALL SELECT name FROM pragma_table_info('oauth_states') WHERE name = 'user_id'
+          UNION ALL SELECT name FROM pragma_table_info('mcp_grant_revocations') WHERE name = 'user_id'
+        `)).toEqual([]);
         expect(await query(persistenceDirectory, "PRAGMA foreign_key_check")).toEqual([]);
       } finally {
         await rm(persistenceDirectory, { recursive: true, force: true });
       }
     },
-    30_000,
+    60_000,
   );
 });

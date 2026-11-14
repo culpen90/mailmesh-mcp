@@ -1,5 +1,5 @@
 import { decryptCredentials } from "./crypto";
-import { getAccount, listAccounts } from "./db";
+import { getAccount, listAccounts, toPublicAccount } from "./db";
 import { asMailMeshError, MailMeshError } from "./errors";
 import { GmailProvider } from "./providers/gmail";
 import { ImapProvider } from "./providers/imap";
@@ -45,20 +45,6 @@ export interface ListMailboxesResult {
   errors: PartialAccountError[];
 }
 
-export function toPublicAccount(account: AccountRecord): PublicAccount {
-  return {
-    id: account.id,
-    provider: account.provider,
-    email: account.email,
-    label: account.label,
-    enabled: account.enabled,
-    scopes: account.scopes.split(/\s+/).filter(Boolean),
-    createdAt: account.createdAt,
-    updatedAt: account.updatedAt,
-    lastError: account.lastError,
-  };
-}
-
 function validateSearchDates(filters: SearchFilters): void {
   const after = filters.after ? new Date(filters.after) : null;
   const before = filters.before ? new Date(filters.before) : null;
@@ -85,17 +71,14 @@ function errorForAccount(error: unknown, account: AccountRecord): PartialAccount
 }
 
 export class MailService {
-  constructor(
-    private readonly env: Env,
-    private readonly userId: string,
-  ) {}
+  constructor(private readonly env: Env) {}
 
   async accounts(): Promise<PublicAccount[]> {
-    return (await listAccounts(this.env.DB, this.userId)).map(toPublicAccount);
+    return (await listAccounts(this.env.DB)).map(toPublicAccount);
   }
 
   private async selectedAccounts(accountIds?: string[]): Promise<AccountRecord[]> {
-    const configured = (await listAccounts(this.env.DB, this.userId)).filter((account) => account.enabled);
+    const configured = await listAccounts(this.env.DB, true);
     const maximum = positiveInteger(this.env.MAX_ACCOUNTS_PER_QUERY, 10, 20);
     if (!accountIds?.length) {
       if (configured.length > maximum) {
@@ -169,14 +152,13 @@ export class MailService {
     const accounts = await this.selectedAccounts(accountIds);
     const maximum = positiveInteger(this.env.MAX_RESULTS_PER_QUERY, 30, 50);
     const limit = Math.min(Math.max(1, Math.trunc(requestedLimit)), maximum);
-    const fingerprint = await searchFingerprint(filters, accounts.map((account) => account.id), limit, this.userId);
-    let cursorState: UnifiedSearchCursor = { v: 2, userId: this.userId, fingerprint, accounts: {} };
+    const fingerprint = await searchFingerprint(filters, accounts.map((account) => account.id), limit);
+    let cursorState: UnifiedSearchCursor = { v: 3, fingerprint, accounts: {} };
 
     if (cursor) {
       cursorState = await decodeCursor<UnifiedSearchCursor>(cursor, this.env.TOKEN_ENCRYPTION_KEY);
       if (
-        cursorState.v !== 2 ||
-        cursorState.userId !== this.userId ||
+        cursorState.v !== 3 ||
         cursorState.fingerprint !== fingerprint ||
         !cursorState.accounts ||
         typeof cursorState.accounts !== "object"
@@ -230,7 +212,7 @@ export class MailService {
     result.messages = result.messages.slice(0, appliedLimit);
     if (Object.values(nextAccountCursors).some((value) => value !== null)) {
       result.nextCursor = await encodeCursor(
-        { v: 2, userId: this.userId, fingerprint, accounts: nextAccountCursors },
+        { v: 3, fingerprint, accounts: nextAccountCursors },
         this.env.TOKEN_ENCRYPTION_KEY,
       );
     }
@@ -238,7 +220,7 @@ export class MailService {
   }
 
   async getMessage(accountId: string, messageId: string): Promise<MessageDetail> {
-    const account = await getAccount(this.env.DB, this.userId, accountId);
+    const account = await getAccount(this.env.DB, accountId);
     if (!account?.enabled) throw new MailMeshError("account_not_found", "The email account was not found or is disabled", 404);
     return (await this.adapter(account)).getMessage(messageId);
   }
@@ -251,7 +233,7 @@ export class MailService {
         403,
       );
     }
-    const account = await getAccount(this.env.DB, this.userId, accountId);
+    const account = await getAccount(this.env.DB, accountId);
     if (!account?.enabled) throw new MailMeshError("account_not_found", "The email account was not found or is disabled", 404);
     const adapter = await this.adapter(account);
     if (!adapter.createDraft) {

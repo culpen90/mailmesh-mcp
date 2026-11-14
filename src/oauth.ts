@@ -4,7 +4,6 @@ import {
   createOAuthState,
   deleteExpiredOAuthStates,
   getAccountByProviderEmail,
-  getUserById,
   toPublicAccount,
   upsertAccount,
 } from "./db";
@@ -133,7 +132,7 @@ export function oauthCallbackUrl(env: Pick<Env, "PUBLIC_BASE_URL">, provider: OA
   return new URL(`/oauth/callback/${callbackProvider}`, base).toString();
 }
 
-export async function startOAuth(env: Env, userId: string, input: OAuthStartInput): Promise<OAuthStartResult> {
+export async function startOAuth(env: Env, input: OAuthStartInput): Promise<OAuthStartResult> {
   const provider = normalizeOAuthProvider(input.provider);
   const definition = getProviderDefinition(env, provider);
   const redirectUri = oauthCallbackUrl(env, provider);
@@ -150,7 +149,6 @@ export async function startOAuth(env: Env, userId: string, input: OAuthStartInpu
   await deleteExpiredOAuthStates(env.DB);
   await createOAuthState(env.DB, {
     state,
-    userId,
     provider: definition.accountProvider,
     label,
     codeVerifier,
@@ -287,10 +285,6 @@ export async function completeOAuthCallback(
   if (!savedState) {
     throw new MailMeshError("invalid_oauth_state", "The OAuth state is invalid, expired, or already used", 400);
   }
-  const user = await getUserById(env.DB, savedState.userId);
-  if (!user?.enabled) {
-    throw new MailMeshError("user_unavailable", "The MailMesh user is disabled or no longer exists", 403);
-  }
 
   const providerError = url.searchParams.get("error");
   if (providerError) {
@@ -312,12 +306,7 @@ export async function completeOAuthCallback(
   }
 
   const email = await fetchProfileEmail(provider, token.access_token);
-  const existing = await getAccountByProviderEmail(
-    env.DB,
-    savedState.userId,
-    definition.accountProvider,
-    email,
-  );
+  const existing = await getAccountByProviderEmail(env.DB, definition.accountProvider, email);
   const refreshToken = typeof token.refresh_token === "string" && token.refresh_token
     ? token.refresh_token
     : await existingRefreshToken(env, existing);
@@ -345,7 +334,6 @@ export async function completeOAuthCallback(
   };
   const encryptedCredentials = await encryptCredentials(credentials, env.TOKEN_ENCRYPTION_KEY);
   const account = await upsertAccount(env.DB, {
-    userId: savedState.userId,
     provider: definition.accountProvider,
     email,
     label: savedState.label || existing?.label || email,

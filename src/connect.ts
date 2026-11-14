@@ -14,7 +14,7 @@ function htmlEscape(value: string): string {
 
 function resultAlert(url: URL): { kind: "success" | "error"; message: string } | null {
   const result = url.searchParams.get("result");
-  if (result === "connected") return { kind: "success", message: "The email account is now linked to your MailMesh user." };
+  if (result === "connected") return { kind: "success", message: "The email account is now linked to this MailMesh instance." };
   if (result === "failed") return { kind: "error", message: "The email account could not be linked. Please try again." };
   return null;
 }
@@ -71,13 +71,11 @@ function connectPage(
 <body>
   <main>
     <h1>Connect an email account</h1>
-    <p>Sign in to your MailMesh user, then choose the email provider you want to link. ${accessDescription}</p>
+    <p>Choose the email provider you want to link to this MailMesh instance. ${accessDescription}</p>
     ${alert}
     <form id="connect-form" autocomplete="off">
-      <label for="username">MailMesh username</label>
-      <input id="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
-      <label for="password">MailMesh password — not your email password</label>
-      <input id="password" type="password" autocomplete="current-password" required>
+      <label for="token">MailMesh instance token</label>
+      <input id="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required>
       <label for="label">Email account label <span aria-hidden="true">(optional)</span></label>
       <input id="label" type="text" maxlength="100" autocomplete="off" placeholder="For example: Work email">
       <div class="actions">
@@ -85,26 +83,18 @@ function connectPage(
         <button type="submit" data-provider="microsoft">Continue with Microsoft</button>
       </div>
     </form>
-    <p class="note">Use this only on a computer you trust. MailMesh sends your login only to this Worker over HTTPS and does not save it in browser storage or put it in the URL.</p>
+    <p class="note">MailMesh sends the instance token to this Worker in an authorization header and clears the field when you continue.</p>
     <div id="client-status" class="alert error" role="alert" hidden></div>
   </main>
   <script nonce="${nonce}">
     const form = document.getElementById("connect-form");
-    const usernameInput = document.getElementById("username");
-    const passwordInput = document.getElementById("password");
+    const tokenInput = document.getElementById("token");
     const labelInput = document.getElementById("label");
     const statusBox = document.getElementById("client-status");
 
     function showError(message) {
       statusBox.textContent = message;
       statusBox.hidden = false;
-    }
-
-    function basicAuthorization(username, password) {
-      const bytes = new TextEncoder().encode(username + ":" + password);
-      let binary = "";
-      bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
-      return "Basic " + btoa(binary);
     }
 
     function validDestination(provider, destination) {
@@ -119,20 +109,19 @@ function connectPage(
       event.preventDefault();
       statusBox.hidden = true;
       const provider = event.submitter && event.submitter.dataset.provider;
-      let username = usernameInput.value.trim();
-      let password = passwordInput.value;
-      if (!username || !password || !["google", "microsoft"].includes(provider)) {
-        showError("Enter your MailMesh username and password, then choose a provider.");
+      let token = tokenInput.value.trim();
+      if (!token || !["google", "microsoft"].includes(provider)) {
+        showError("Enter the MailMesh instance token and choose a provider.");
         return;
       }
 
       const label = labelInput.value.trim();
       const buttons = [...form.querySelectorAll("button")];
       buttons.forEach((button) => { button.disabled = true; });
-      passwordInput.value = "";
+      tokenInput.value = "";
 
       try {
-        const response = await fetch("/api/oauth/start", {
+        const response = await fetch("/admin/oauth/start", {
           method: "POST",
           credentials: "omit",
           cache: "no-store",
@@ -140,7 +129,7 @@ function connectPage(
           redirect: "error",
           referrerPolicy: "no-referrer",
           headers: {
-            authorization: basicAuthorization(username, password),
+            authorization: "Bearer " + token,
             "content-type": "application/json"
           },
           body: JSON.stringify({ provider, ...(label ? { label } : {}) })
@@ -151,17 +140,15 @@ function connectPage(
         const destination = new URL(data.authorizationUrl);
         if (!validDestination(provider, destination)) throw new Error("invalid_destination");
 
-        username = "";
-        password = "";
+        token = "";
         location.replace(destination.href);
       } catch (error) {
         showError(error instanceof Error && error.message === "unauthorized"
-          ? "The MailMesh username or password was not accepted."
+          ? "The MailMesh instance token was not accepted."
           : "MailMesh could not start the email connection. Please try again.");
       } finally {
-        username = "";
-        password = "";
-        passwordInput.value = "";
+        token = "";
+        tokenInput.value = "";
         buttons.forEach((button) => { button.disabled = false; });
       }
     });
@@ -183,7 +170,7 @@ function connectPage(
   });
 }
 
-/** Serve the browser-based email connection page without persisting login credentials. */
+/** Serve the browser-based email connection page. */
 export async function handleConnectRequest(request: Request, env: Env): Promise<Response | null> {
   const url = new URL(request.url);
   if (url.pathname !== CONNECT_PATH && url.pathname !== `${CONNECT_PATH}/`) return null;

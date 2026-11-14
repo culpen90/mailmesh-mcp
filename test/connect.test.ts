@@ -36,7 +36,7 @@ describe("cross-computer email connection page", () => {
     expect(body).toContain(`<style nonce="${nonce}">`);
   });
 
-  it("keeps login credentials out of HTML values, URLs, and browser storage", async () => {
+  it("keeps the instance token out of HTML values, URLs, and browser storage", async () => {
     const response = await handleConnectRequest(
       new Request(`${workerOrigin}/connect?token=${encodeURIComponent(adminToken)}`),
       env(),
@@ -44,10 +44,10 @@ describe("cross-computer email connection page", () => {
     const body = await response?.text() ?? "";
 
     expect(body).toContain("Connect an email account");
-    expect(body).toMatch(/<input id="username"(?![^>]*\bname=)[^>]*type="text"/);
-    expect(body).toMatch(/<input id="password"(?![^>]*\bname=)[^>]*type="password"/);
-    expect(body).toContain('authorization: basicAuthorization(username, password)');
-    expect(body).toContain('fetch("/api/oauth/start"');
+    expect(body).toMatch(/<input id="token"(?![^>]*\bname=)[^>]*type="password"/);
+    expect(body).not.toContain('<input id="username"');
+    expect(body).toContain('authorization: "Bearer " + token');
+    expect(body).toContain('fetch("/admin/oauth/start"');
     expect(body).not.toContain(adminToken);
     expect(body).not.toContain("localStorage");
     expect(body).not.toContain("sessionStorage");

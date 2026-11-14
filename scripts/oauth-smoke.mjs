@@ -3,15 +3,17 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const [baseUrl = "http://localhost:8787"] = process.argv.slice(2);
-const ownerToken = process.env.MAILMESH_TOKEN;
-if (!ownerToken) {
-  console.error("Usage: MAILMESH_TOKEN=<owner-token> npm run oauth-smoke -- <worker-origin>");
+const operatorToken = process.env.MAILMESH_TOKEN;
+if (!operatorToken) {
+  console.error("Usage: MAILMESH_TOKEN=<operator-token> npm run oauth-smoke -- <worker-origin>");
   process.exit(2);
 }
 
 const base = new URL(baseUrl).origin;
 const mcpUrl = `${base}/mcp`;
 const redirectUri = "https://claude.ai/api/mcp/auth_callback";
+const clientName = `MailMesh OAuth smoke test ${randomBytes(8).toString("hex")}`;
+const operatorAuthorization = `Bearer ${operatorToken}`;
 
 async function expectJson(response, expectedStatus) {
   const text = await response.text();
@@ -22,7 +24,7 @@ async function expectJson(response, expectedStatus) {
     throw new Error(`Expected JSON from ${response.url || "request"}; received HTTP ${response.status}`);
   }
   if (response.status !== expectedStatus) {
-    throw new Error(`Expected HTTP ${expectedStatus}; received ${response.status}: ${JSON.stringify(value).slice(0, 500)}`);
+    throw new Error(`Expected HTTP ${expectedStatus} from ${response.url}; received ${response.status}`);
   }
   return value;
 }
@@ -39,6 +41,23 @@ async function tokenRequest(form) {
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams(form),
   });
+}
+
+async function findTestConnection() {
+  const url = new URL(`${base}/admin/mcp-connections`);
+  const cursors = new Set();
+  while (true) {
+    const page = await expectJson(
+      await fetch(url, { headers: { authorization: operatorAuthorization } }),
+      200,
+    );
+    const connection = page.connections.find((entry) => entry.clientName === clientName);
+    if (connection) return connection;
+    if (!page.nextCursor) return null;
+    if (cursors.has(page.nextCursor)) throw new Error("MCP connection listing repeated a cursor");
+    cursors.add(page.nextCursor);
+    url.searchParams.set("cursor", page.nextCursor);
+  }
 }
 
 async function connectMcp(token) {
@@ -83,7 +102,7 @@ const registration = await expectJson(
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
-      client_name: "MailMesh OAuth smoke test",
+      client_name: clientName,
       redirect_uris: [redirectUri],
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
@@ -111,6 +130,9 @@ if (consentResponse.status !== 200) throw new Error(`Consent page returned ${con
 const cookie = consentResponse.headers.get("set-cookie")?.split(";", 1)[0];
 const consentHtml = await consentResponse.text();
 if (!cookie) throw new Error("Consent page did not set its CSRF cookie");
+if (!consentHtml.includes("A connection belongs to the whole client account")) {
+  throw new Error("Consent page did not disclose shared client-account access");
+}
 const consentId = hiddenValue(consentHtml, "consent-id");
 const csrfToken = hiddenValue(consentHtml, "csrf-token");
 
@@ -118,12 +140,17 @@ const approval = await expectJson(
   await fetch(`${base}/authorize`, {
     method: "POST",
     headers: {
-      authorization: `Bearer ${ownerToken}`,
+      authorization: operatorAuthorization,
       "content-type": "application/json",
       cookie,
       origin: base,
     },
-    body: JSON.stringify({ consent_id: consentId, csrf_token: csrfToken, decision: "approve" }),
+    body: JSON.stringify({
+      consent_id: consentId,
+      csrf_token: csrfToken,
+      decision: "approve",
+      shared_client_access_acknowledged: true,
+    }),
   }),
   200,
 );
@@ -150,17 +177,30 @@ if (tokens0.resource !== mcpUrl || !tokens0.scope.split(" ").includes("mail:read
 }
 
 const oauthMcp = await connectMcp(tokens0.access_token);
-const staticMcp = await connectMcp(ownerToken);
+const staticMcp = await connectMcp(operatorToken);
+if (!oauthMcp.accountCallSucceeded || !staticMcp.accountCallSucceeded) {
+  throw new Error("The mailbox listing tool failed");
+}
 
 const adminWithOAuth = await fetch(`${base}/admin/accounts`, {
   headers: { authorization: `Bearer ${tokens0.access_token}` },
 });
 if (adminWithOAuth.status !== 401) throw new Error("OAuth token crossed the admin boundary");
 
-const adminWithOwner = await fetch(`${base}/admin/accounts`, {
-  headers: { authorization: `Bearer ${ownerToken}` },
+const adminWithOperator = await fetch(`${base}/admin/accounts`, {
+  headers: { authorization: operatorAuthorization },
 });
-if (adminWithOwner.status !== 200) throw new Error("Owner token no longer works for admin access");
+if (adminWithOperator.status !== 200) throw new Error("Operator bearer did not authorize account management");
+
+const adminWithBasic = await fetch(`${base}/admin/accounts`, {
+  headers: { authorization: `Basic ${Buffer.from("retired-user:retired-password").toString("base64")}` },
+});
+if (adminWithBasic.status !== 401) throw new Error("Operator route accepted Basic authentication");
+
+for (const path of ["/api/accounts", "/admin/users"]) {
+  const response = await fetch(`${base}${path}`, { headers: { authorization: operatorAuthorization } });
+  if (response.status !== 404) throw new Error(`Retired route ${path} returned ${response.status}`);
+}
 
 const tokens1 = await expectJson(
   await tokenRequest({
@@ -190,16 +230,29 @@ const staleRefresh = await tokenRequest({
 const staleBody = await expectJson(staleRefresh, 400);
 if (staleBody.error !== "invalid_grant") throw new Error("Old refresh token failed with the wrong OAuth error");
 
-const revocation = await tokenRequest({
-  token: tokens2.refresh_token,
-  token_type_hint: "refresh_token",
-  client_id: registration.client_id,
+const testConnection = await findTestConnection();
+if (typeof testConnection?.id !== "string" || !testConnection.id) {
+  throw new Error("The test grant did not appear in the operator's connection list");
+}
+const revocation = await fetch(`${base}/admin/mcp-connections/${encodeURIComponent(testConnection.id)}`, {
+  method: "DELETE",
+  headers: { authorization: operatorAuthorization },
 });
-if (revocation.status !== 200) throw new Error(`Refresh-token revocation returned ${revocation.status}`);
+if (revocation.status !== 204) throw new Error(`Operator revocation returned ${revocation.status}`);
 const revokedAccess = await fetch(mcpUrl, {
   headers: { authorization: `Bearer ${tokens2.access_token}` },
 });
-if (revokedAccess.status !== 401) throw new Error("Revoking the refresh token did not revoke its grant");
+if (revokedAccess.status !== 401) throw new Error("Operator revocation did not reject the grant's access token");
+const revokedRefresh = await expectJson(
+  await tokenRequest({
+    grant_type: "refresh_token",
+    client_id: registration.client_id,
+    refresh_token: tokens2.refresh_token,
+    resource: mcpUrl,
+  }),
+  400,
+);
+if (revokedRefresh.error !== "invalid_grant") throw new Error("Revoked refresh token failed with the wrong OAuth error");
 
 console.log(JSON.stringify({
   oauthReady: true,
@@ -214,7 +267,12 @@ console.log(JSON.stringify({
   challenge: { status: challengeResponse.status, hasResourceMetadata: true, scope: "mail:read" },
   oauthMcp,
   staticMcp,
-  adminBoundary: { oauthTokenStatus: adminWithOAuth.status, ownerTokenStatus: adminWithOwner.status },
+  adminBoundary: {
+    oauthTokenStatus: adminWithOAuth.status,
+    operatorTokenStatus: adminWithOperator.status,
+    basicAuthStatus: adminWithBasic.status,
+    retiredRoutesStatus: 404,
+  },
   refreshRotation: { succeeded: true, staleTokenError: staleBody.error },
-  cleanup: { grantRevoked: true, revokedAccessStatus: revokedAccess.status },
+  cleanup: { grantRevoked: true, revokedAccessStatus: revokedAccess.status, refreshError: revokedRefresh.error },
 }, null, 2));

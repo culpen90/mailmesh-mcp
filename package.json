@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A tenant-isolated Cloudflare Workers MCP server that gives each user their own linked email accounts.",
+  "description": "A private Cloudflare Workers MCP server for linked email accounts.",
   "scripts": {
     "build": "wrangler deploy --dry-run --outdir dist",
     "check": "npm run typecheck && npm test && npm run build",

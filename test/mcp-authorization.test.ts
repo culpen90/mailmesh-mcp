@@ -1,17 +1,24 @@
 import type { AuthRequest, ClientInfo, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { describe, expect, it, vi } from "vitest";
+import { getMcpAuthorization } from "../src/db";
 import {
   canonicalMcpResource,
   guardMcpClientRegistrationRequest,
   handleMcpAuthorizationRequest,
   validateMcpClientRegistration,
 } from "../src/mcp-authorization";
+import { MCP_GRANT_PRINCIPAL } from "../src/mcp-oauth-policy";
 import type { Env } from "../src/types";
-import { createPasswordData } from "../src/user-auth";
+
+vi.mock("../src/db", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../src/db")>(),
+  getMcpAuthorization: vi.fn(),
+}));
 
 const origin = "https://mailmesh.example.com";
 const resource = `${origin}/mcp`;
 const ownerToken = "owner-token-with-high-entropy-for-tests";
+const OMIT_ACKNOWLEDGEMENT = Symbol("omit-acknowledgement");
 
 class MemoryKv {
   readonly values = new Map<string, string>();
@@ -70,34 +77,19 @@ function setup(
       redirectTo: `${requestInfo.redirectUri}?code=short-lived-code&state=${requestInfo.state}`,
     })),
   } as unknown as OAuthHelpers;
-  const ownerRow = {
-    id: "mailmesh-owner",
-    username: "owner",
-    display_name: "MailMesh Owner",
-    password_algorithm: "",
-    password_hash: "",
-    password_salt: "",
-    password_iterations: 0,
-    auth_version: 1,
-    enabled: 1,
-    created_at: "2026-07-20T00:00:00.000Z",
-    updated_at: "2026-07-20T00:00:00.000Z",
-  };
-  const first = vi.fn(async () => ownerRow);
-  const bind = vi.fn(() => ({ first }));
-  const prepare = vi.fn(() => ({ bind }));
+  const authorization = { authVersion: 1, grantRevoked: false };
+  vi.mocked(getMcpAuthorization).mockResolvedValue(authorization);
   const environment = {
-    DB: { prepare } as unknown as D1Database,
+    DB: {} as D1Database,
     OAUTH_KV: kv as unknown as KVNamespace,
     OAUTH_FLOW_RATE_LIMITER: { limit: vi.fn(async () => ({ success: true })) } as unknown as RateLimit,
-    AUTH_RATE_LIMITER: { limit: vi.fn(async () => ({ success: true })) } as unknown as RateLimit,
     OAUTH_PROVIDER: helpers,
     MAILMESH_TOKEN: ownerToken,
     TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 5).toString("base64"),
     PUBLIC_BASE_URL: origin,
     WRITE_MODE: writeMode,
   } satisfies Env;
-  return { kv, requestInfo, clientInfo, helpers, environment, ownerRow };
+  return { kv, requestInfo, clientInfo, helpers, environment, authorization };
 }
 
 function hiddenValue(body: string, id: string): string {
@@ -129,6 +121,7 @@ function consentRequest(
   cookie: string,
   token = ownerToken,
   decision: "approve" | "deny" = "approve",
+  acknowledgement: unknown = true,
 ): Request {
   const headers: Record<string, string> = {
     "content-type": "application/json",
@@ -136,29 +129,14 @@ function consentRequest(
     origin,
   };
   if (token) headers.authorization = `Bearer ${token}`;
+  const body: Record<string, unknown> = { consent_id: consentId, csrf_token: csrfToken, decision };
+  if (acknowledgement !== OMIT_ACKNOWLEDGEMENT) {
+    body.shared_client_access_acknowledged = acknowledgement;
+  }
   return new Request(`${origin}/authorize`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ consent_id: consentId, csrf_token: csrfToken, decision }),
-  });
-}
-
-function basicConsentRequest(
-  consentId: string,
-  csrfToken: string,
-  cookie: string,
-  username: string,
-  password: string,
-): Request {
-  return new Request(`${origin}/authorize`, {
-    method: "POST",
-    headers: {
-      authorization: `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`,
-      "content-type": "application/json",
-      cookie,
-      origin,
-    },
-    body: JSON.stringify({ consent_id: consentId, csrf_token: csrfToken, decision: "approve" }),
+    body: JSON.stringify(body),
   });
 }
 
@@ -179,9 +157,13 @@ describe("MCP OAuth authorization", () => {
     expect(body).not.toContain(maliciousName);
     expect(body).not.toContain("attacker.example");
     expect(body).toContain("Will return to claude.ai");
-    expect(body).toMatch(/<input id="username"(?![^>]*\bname=)[^>]*type="text"/);
-    expect(body).toMatch(/<input id="password"(?![^>]*\bname=)[^>]*type="password"/);
-    expect(body).toContain("headers.authorization = basicAuthorization(username, password)");
+    expect(body).toMatch(/<input id="token"(?![^>]*\bname=)[^>]*type="password"/);
+    expect(body).not.toContain('<input id="username"');
+    expect(body).toContain('headers.authorization = "Bearer " + token');
+    expect(body).toContain("A connection belongs to the whole client account");
+    expect(body).toContain("access the email accounts linked to this MailMesh instance");
+    expect(body).toContain('id="shared-client-access-acknowledged" type="checkbox"');
+    expect(body).toContain("shared_client_access_acknowledged");
     expect(body).not.toContain(ownerToken);
     expect(body).not.toContain("localStorage");
     expect(body).not.toContain("sessionStorage");
@@ -222,14 +204,21 @@ describe("MCP OAuth authorization", () => {
     expect(response?.headers.get("set-cookie")).toContain("Max-Age=0");
     expect(kv.values.size).toBe(0);
     expect(helpers.completeAuthorization).toHaveBeenCalledWith(expect.objectContaining({
-      userId: "mailmesh-owner",
+      userId: MCP_GRANT_PRINCIPAL,
+      revokeExistingGrants: false,
       scope: ["mail:read", "offline_access"],
       props: expect.objectContaining({
         authType: "oauth",
-        userId: "mailmesh-owner",
+        principal: MCP_GRANT_PRINCIPAL,
         authVersion: 1,
         scopes: ["mail:read", "offline_access"],
         canCreateDrafts: false,
+        sharedClientAccessAcknowledgementVersion: 1,
+      }),
+      metadata: expect.objectContaining({
+        authVersion: 1,
+        sharedClientAccessAcknowledgementVersion: 1,
+        sharedClientAccessAcknowledgedAt: expect.any(String),
       }),
     }));
 
@@ -241,38 +230,50 @@ describe("MCP OAuth authorization", () => {
     expect(helpers.completeAuthorization).toHaveBeenCalledTimes(1);
   });
 
-  it("issues a tenant-bound grant after password authentication", async () => {
-    const { environment, helpers, ownerRow } = setup();
-    const password = "tenant-password:42";
-    const passwordData = await createPasswordData(password, environment.TOKEN_ENCRYPTION_KEY);
-    Object.assign(ownerRow, {
-      id: "user-a",
-      username: "user.a",
-      display_name: "User A",
-      password_algorithm: passwordData.algorithm,
-      password_hash: passwordData.hash,
-      password_salt: passwordData.salt,
-      password_iterations: passwordData.iterations,
-      auth_version: 7,
-    });
+  it("uses the current authorization version at approval", async () => {
+    const { environment, helpers, authorization } = setup();
     const { consentId, csrfToken, cookie } = await begin(environment);
+    authorization.authVersion = 7;
     const response = await handleMcpAuthorizationRequest(
-      basicConsentRequest(consentId, csrfToken, cookie, "user.a", password),
+      consentRequest(consentId, csrfToken, cookie),
       environment,
     );
 
     expect(response?.status).toBe(200);
     expect(helpers.completeAuthorization).toHaveBeenCalledWith(expect.objectContaining({
-      userId: "user-a",
-      props: expect.objectContaining({
-        principal: "user:user-a",
-        userId: "user-a",
-        authVersion: 7,
-      }),
+      props: expect.objectContaining({ authVersion: 7 }),
+      metadata: expect.objectContaining({ authVersion: 7 }),
     }));
   });
 
-  it("rejects the wrong owner token without echoing it", async () => {
+  it("rejects Basic credentials for consent", async () => {
+    const { environment, helpers } = setup();
+    const { consentId, csrfToken, cookie } = await begin(environment);
+    const request = consentRequest(consentId, csrfToken, cookie);
+    request.headers.set("authorization", `Basic ${btoa(`former-user:${ownerToken}`)}`);
+
+    const response = await handleMcpAuthorizationRequest(request, environment);
+
+    expect(response?.status).toBe(401);
+    expect(helpers.completeAuthorization).not.toHaveBeenCalled();
+  });
+
+  it("rejects a consent request started under the old user model", async () => {
+    const { environment, helpers, kv } = setup();
+    const { consentId, csrfToken, cookie } = await begin(environment);
+    const currentKey = `mailmesh:oauth-consent:v2:${consentId}`;
+    const state = await kv.get(currentKey);
+    if (!state) throw new Error("Expected the current consent record");
+    await kv.delete(currentKey);
+    await kv.put(`mailmesh:oauth-consent:${consentId}`, state);
+
+    const response = await handleMcpAuthorizationRequest(consentRequest(consentId, csrfToken, cookie), environment);
+
+    expect(response?.status).toBe(400);
+    expect(helpers.completeAuthorization).not.toHaveBeenCalled();
+  });
+
+  it("rejects the wrong instance token without echoing it", async () => {
     const { environment, helpers } = setup();
     const { consentId, csrfToken, cookie } = await begin(environment);
     const rejectedToken = "wrong-secret-value";
@@ -285,6 +286,57 @@ describe("MCP OAuth authorization", () => {
     expect(response?.status).toBe(401);
     expect(body).not.toContain(rejectedToken);
     expect(helpers.completeAuthorization).not.toHaveBeenCalled();
+  });
+
+  it("rate-limits token approvals separately from consent setup", async () => {
+    const { environment, helpers } = setup();
+    const { consentId, csrfToken, cookie } = await begin(environment);
+    const limit = vi.mocked(environment.OAUTH_FLOW_RATE_LIMITER.limit);
+    limit.mockResolvedValueOnce({ success: false });
+    const request = consentRequest(consentId, csrfToken, cookie);
+    request.headers.set("cf-connecting-ip", "203.0.113.8");
+
+    const response = await handleMcpAuthorizationRequest(request, environment);
+
+    expect(response?.status).toBe(429);
+    expect(limit).toHaveBeenCalledWith({ key: "authorize:unknown" });
+    expect(limit).toHaveBeenCalledWith({ key: "approve:203.0.113.8" });
+    expect(helpers.completeAuthorization).not.toHaveBeenCalled();
+  });
+
+  it.each([false, "true", 1, null])(
+    "does not authorize without the exact client-access acknowledgement: %s",
+    async (acknowledgement) => {
+      const { environment, helpers, kv } = setup();
+      const { consentId, csrfToken, cookie } = await begin(environment);
+      const response = await handleMcpAuthorizationRequest(
+        consentRequest(consentId, csrfToken, cookie, ownerToken, "approve", acknowledgement),
+        environment,
+      );
+
+      expect(response?.status).toBe(400);
+      expect(kv.values.size).toBe(1);
+      expect(helpers.completeAuthorization).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps consent usable after an omitted acknowledgement is rejected", async () => {
+    const { environment, helpers, kv } = setup();
+    const { consentId, csrfToken, cookie } = await begin(environment);
+
+    const rejected = await handleMcpAuthorizationRequest(
+      consentRequest(consentId, csrfToken, cookie, ownerToken, "approve", OMIT_ACKNOWLEDGEMENT),
+      environment,
+    );
+    expect(rejected?.status).toBe(400);
+    expect(kv.values.size).toBe(1);
+
+    const retried = await handleMcpAuthorizationRequest(
+      consentRequest(consentId, csrfToken, cookie),
+      environment,
+    );
+    expect(retried?.status).toBe(200);
+    expect(helpers.completeAuthorization).toHaveBeenCalledTimes(1);
   });
 
   it("rejects cross-origin and mismatched CSRF submissions", async () => {
@@ -302,11 +354,11 @@ describe("MCP OAuth authorization", () => {
     expect(helpers.completeAuthorization).not.toHaveBeenCalled();
   });
 
-  it("supports a CSRF-protected denial without requiring the owner token", async () => {
+  it("supports a CSRF-protected denial without requiring the instance token", async () => {
     const { environment, helpers } = setup();
     const { consentId, csrfToken, cookie } = await begin(environment);
     const response = await handleMcpAuthorizationRequest(
-      consentRequest(consentId, csrfToken, cookie, "", "deny"),
+      consentRequest(consentId, csrfToken, cookie, "", "deny", false),
       environment,
     );
     const body = await response?.json() as { redirectTo?: string };
@@ -370,6 +422,8 @@ describe("MCP OAuth dynamic client registration policy", () => {
   it.each([
     "https://claude.ai/api/mcp/auth_callback",
     "https://chatgpt.com/connector/oauth/callback",
+    "https://chatgpt.com/connector/oauth/callback-id_123",
+    "https://chatgpt.com/connector_platform_oauth_redirect",
     "https://auth.openai.com/mcp/callback",
   ])("accepts an official hosted callback: %s", (redirectUri) => {
     expect(validateMcpClientRegistration(registration([redirectUri]))).toBeUndefined();
@@ -384,6 +438,12 @@ describe("MCP OAuth dynamic client registration policy", () => {
     "https://evil.claude.ai/api/mcp/auth_callback",
     "https://claude.ai/not-the-callback",
     "https://evil.openai.com/callback",
+    "https://chatgpt.com/not-the-connector-callback",
+    "https://chatgpt.com/connector/oauth/",
+    "https://chatgpt.com/connector/oauth/callback/extra",
+    "https://chatgpt.com/connector/oauth/callback%2Fextra",
+    "https://auth.openai.com/not-the-mcp-callback",
+    "https://chatgpt.com/connector/oauth/callback?tenant=other",
   ])("rejects an untrusted callback: %s", (redirectUri) => {
     expect(validateMcpClientRegistration(registration([redirectUri]))).toEqual(expect.objectContaining({
       description: expect.any(String),
@@ -394,6 +454,13 @@ describe("MCP OAuth dynamic client registration policy", () => {
     const redirect = "https://claude.ai/api/mcp/auth_callback";
     expect(validateMcpClientRegistration(registration([redirect], { software_statement: "unsigned" }))).toBeTruthy();
     expect(validateMcpClientRegistration(registration([redirect], { grant_types: ["client_credentials"] }))).toBeTruthy();
+  });
+
+  it("rejects a mixed callback list when any redirect is untrusted", () => {
+    expect(validateMcpClientRegistration(registration([
+      "https://chatgpt.com/connector/oauth/callback",
+      "https://attacker.example/callback",
+    ]))).toBeTruthy();
   });
 
   it("caps registration metadata and contacts", () => {

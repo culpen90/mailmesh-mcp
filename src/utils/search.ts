@@ -5,10 +5,8 @@ export async function searchFingerprint(
   filters: SearchFilters,
   accountIds: string[],
   limit: number,
-  userId?: string,
 ): Promise<string> {
   const canonical = JSON.stringify({
-    userId: userId ?? null,
     accountIds,
     limit,
     query: filters.query ?? null,

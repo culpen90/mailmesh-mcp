@@ -23,7 +23,6 @@ function providerContext(maxMessageBytes = 1024): ProviderContext {
     },
     account: {
       id: "microsoft-1",
-      userId: "mailmesh-owner",
       provider: "microsoft",
       email: "owner@example.com",
       label: "Work",

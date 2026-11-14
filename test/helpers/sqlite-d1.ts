@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 
 const nodeRequire = createRequire(import.meta.url);
+export const supportsNodeSqlite = Number(process.versions.node.split(".", 1)[0]) >= 22;
 
 function openMemoryDatabase(): DatabaseSync {
   const sqlite = nodeRequire("node:sqlite") as typeof import("node:sqlite");
@@ -69,9 +70,14 @@ export class SqliteD1TestDatabase {
     prepare: (sql: string) => new SqliteD1Statement(this.sqlite, sql),
   } as unknown as D1Database;
 
-  constructor() {
+  constructor(schema: "workspace" | "multi-user" | "initial" = "workspace") {
     this.sqlite.exec(readFileSync(new URL("../../migrations/0001_initial.sql", import.meta.url), "utf8"));
+    if (schema === "initial") return;
     this.sqlite.exec(readFileSync(new URL("../../migrations/0002_multi_user.sql", import.meta.url), "utf8"));
+    this.sqlite.exec(readFileSync(new URL("../../migrations/0003_mcp_grant_revocations.sql", import.meta.url), "utf8"));
+    if (schema === "workspace") {
+      this.sqlite.exec(readFileSync(new URL("../../migrations/0004_workspace.sql", import.meta.url), "utf8"));
+    }
   }
 
   exec(sql: string): void {

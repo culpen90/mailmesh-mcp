@@ -5,10 +5,10 @@ import type {
   ClientRegistrationCallbackResult,
   OAuthHelpers,
 } from "@cloudflare/workers-oauth-provider";
-import { constantTimeEqual, randomBase64Url } from "./crypto";
-import { MailMeshError } from "./errors";
+import { constantTimeEqual, hasValidBearerToken, randomBase64Url } from "./crypto";
+import { getMcpAuthorization } from "./db";
+import { MCP_GRANT_PRINCIPAL, SHARED_CLIENT_ACCESS_ACKNOWLEDGEMENT_VERSION } from "./mcp-oauth-policy";
 import type { Env } from "./types";
-import { authenticateUserOrLegacyOwner } from "./user-auth";
 import { jsonResponse } from "./utils/http";
 
 export const MAIL_READ_SCOPE = "mail:read";
@@ -16,7 +16,7 @@ export const OFFLINE_ACCESS_SCOPE = "offline_access";
 export const AUTHORIZATION_SCOPES = [MAIL_READ_SCOPE, OFFLINE_ACCESS_SCOPE] as const;
 
 const CONSENT_TTL_SECONDS = 600;
-const CONSENT_KEY_PREFIX = "mailmesh:oauth-consent:";
+const CONSENT_KEY_PREFIX = "mailmesh:oauth-consent:v2:";
 const CSRF_COOKIE = "__Host-MailMeshOAuthCSRF";
 const PKCE_CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
 const CONSENT_ID = /^[A-Za-z0-9_-]{32,128}$/;
@@ -34,18 +34,17 @@ interface ConsentSubmission {
   consent_id?: unknown;
   csrf_token?: unknown;
   decision?: unknown;
+  shared_client_access_acknowledged?: unknown;
 }
 
 type OAuthEnv = Pick<
   Env,
-  | "AUTH_RATE_LIMITER"
   | "DB"
   | "MAILMESH_TOKEN"
   | "OAUTH_FLOW_RATE_LIMITER"
   | "OAUTH_KV"
   | "OAUTH_PROVIDER"
   | "PUBLIC_BASE_URL"
-  | "TOKEN_ENCRYPTION_KEY"
   | "WRITE_MODE"
 >;
 
@@ -104,7 +103,7 @@ function clearCsrfCookie(): string {
   return csrfCookie("", 0);
 }
 
-function oauthFlowRateKey(request: Request, operation: "authorize" | "register"): string {
+function oauthFlowRateKey(request: Request, operation: "authorize" | "approve" | "register"): string {
   return `${operation}:${request.headers.get("cf-connecting-ip") ?? "unknown"}`;
 }
 
@@ -216,8 +215,12 @@ function consentPage(
     .client strong, .client span { display: block; overflow-wrap: anywhere; }
     .client span { margin-top: 5px; color: #64748b; font-size: .9rem; }
     label { display: block; margin: 18px 0 7px; font-weight: 650; }
-    input { width: 100%; min-height: 46px; padding: 10px 12px; border: 1px solid #b8c4d6; border-radius: 10px; background: #fff; color: #14213d; font: inherit; }
+    input[type="password"] { width: 100%; min-height: 46px; padding: 10px 12px; border: 1px solid #b8c4d6; border-radius: 10px; background: #fff; color: #14213d; font: inherit; }
     input:focus { outline: 3px solid rgba(37, 99, 235, .22); border-color: #2563eb; }
+    .shared-client-warning { margin-top: 22px; padding: 14px; border: 1px solid #d59b2b; border-radius: 12px; background: #fff8e6; color: #6f4700; }
+    .shared-client-warning p { margin: 0 0 12px; color: inherit; }
+    .acknowledgement { display: grid; grid-template-columns: auto 1fr; gap: 10px; align-items: start; margin: 0; font-weight: 600; }
+    .acknowledgement input { width: 20px; height: 20px; margin: 2px 0 0; accent-color: #2563eb; }
     .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 24px; }
     button { min-height: 48px; border: 0; border-radius: 10px; font: inherit; font-weight: 700; cursor: pointer; }
     button[value="approve"] { background: #2563eb; color: #fff; }
@@ -230,7 +233,8 @@ function consentPage(
       main { border-color: #334155; background: #172033; box-shadow: none; }
       p, .note, .client span { color: #b8c4d6; }
       .client { border-color: #334155; background: #0f172a; }
-      input { border-color: #52637a; background: #0f172a; color: #f8fafc; }
+      input[type="password"] { border-color: #52637a; background: #0f172a; color: #f8fafc; }
+      .shared-client-warning { border-color: #a87920; background: #33280f; color: #ffe4a3; }
       button[value="deny"] { background: #334155; color: #f8fafc; }
       .alert { border-color: #9f4040; background: #3a1d24; color: #ffd2d2; }
     }
@@ -244,22 +248,27 @@ function consentPage(
     <form id="consent-form" autocomplete="off">
       <input id="consent-id" type="hidden" value="${htmlEscape(consentId)}">
       <input id="csrf-token" type="hidden" value="${htmlEscape(csrfToken)}">
-      <label for="username">MailMesh username</label>
-      <input id="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false">
-      <label for="password">MailMesh password — not your email password</label>
-      <input id="password" type="password" autocomplete="current-password">
+      <label for="token">MailMesh instance token</label>
+      <input id="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false">
+      <div class="shared-client-warning">
+        <p><strong>A connection belongs to the whole client account.</strong> Everyone who can use that account can access the email accounts linked to this MailMesh instance and may see email returned to its chats.</p>
+        <label class="acknowledgement" for="shared-client-access-acknowledged">
+          <input id="shared-client-access-acknowledged" type="checkbox">
+          <span>I understand who will be able to use this MailMesh connection.</span>
+        </label>
+      </div>
       <div class="actions">
         <button type="submit" name="decision" value="deny">Cancel</button>
         <button type="submit" name="decision" value="approve">${approvalLabel}</button>
       </div>
     </form>
-    <p class="note">The app never receives your MailMesh password. MailMesh verifies it here, then issues separate short-lived OAuth credentials scoped to your user.</p>
+    <p class="note">MailMesh verifies the instance token here and issues separate OAuth credentials to the client.</p>
     <div id="status" class="alert" role="alert" hidden></div>
   </main>
   <script nonce="${nonce}">
     const form = document.getElementById("consent-form");
-    const usernameInput = document.getElementById("username");
-    const passwordInput = document.getElementById("password");
+    const tokenInput = document.getElementById("token");
+    const sharedClientAcknowledgement = document.getElementById("shared-client-access-acknowledged");
     const statusBox = document.getElementById("status");
     const expectedRedirect = new URL(${scriptJson(authRequest.redirectUri)});
 
@@ -268,29 +277,25 @@ function consentPage(
       statusBox.hidden = false;
     }
 
-    function basicAuthorization(username, password) {
-      const bytes = new TextEncoder().encode(username + ":" + password);
-      let binary = "";
-      bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
-      return "Basic " + btoa(binary);
-    }
-
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       statusBox.hidden = true;
       const decision = event.submitter && event.submitter.value === "deny" ? "deny" : "approve";
-      let username = usernameInput.value.trim();
-      let password = passwordInput.value;
-      if (decision === "approve" && (!username || !password)) {
-        showError("Enter your MailMesh username and password.");
+      let token = tokenInput.value.trim();
+      if (decision === "approve" && !token) {
+        showError("Enter the MailMesh instance token.");
+        return;
+      }
+      if (decision === "approve" && !sharedClientAcknowledgement.checked) {
+        showError("Acknowledge who can use this client account before allowing access.");
         return;
       }
 
       const buttons = [...form.querySelectorAll("button")];
       buttons.forEach((button) => { button.disabled = true; });
-      passwordInput.value = "";
+      tokenInput.value = "";
       const headers = { "content-type": "application/json" };
-      if (decision === "approve") headers.authorization = basicAuthorization(username, password);
+      if (decision === "approve") headers.authorization = "Bearer " + token;
 
       try {
         const response = await fetch("/authorize", {
@@ -304,7 +309,8 @@ function consentPage(
           body: JSON.stringify({
             consent_id: document.getElementById("consent-id").value,
             csrf_token: document.getElementById("csrf-token").value,
-            decision
+            decision,
+            shared_client_access_acknowledged: decision === "approve" && sharedClientAcknowledgement.checked
           })
         });
         const data = await response.json();
@@ -321,17 +327,15 @@ function consentPage(
           destination.hash !== ""
         ) throw new Error("invalid_destination");
 
-        username = "";
-        password = "";
+        token = "";
         location.replace(destination.href);
       } catch (error) {
         showError(error instanceof Error && error.message === "unauthorized"
-          ? "The MailMesh username or password was not accepted. Start the connection again and retry."
+          ? "The MailMesh instance token was not accepted. Start the connection again and retry."
           : "MailMesh could not finish authorization. Return to the app and try connecting again.");
       } finally {
-        username = "";
-        password = "";
-        passwordInput.value = "";
+        token = "";
+        tokenInput.value = "";
         buttons.forEach((button) => { button.disabled = false; });
       }
     });
@@ -371,7 +375,7 @@ async function readConsentSubmission(request: Request): Promise<ConsentSubmissio
 function deniedRedirect(request: AuthRequest): string {
   const destination = new URL(request.redirectUri);
   destination.searchParams.set("error", "access_denied");
-  destination.searchParams.set("error_description", "The MailMesh user denied access");
+  destination.searchParams.set("error_description", "The MailMesh operator denied access");
   destination.searchParams.set("state", request.state);
   return destination.toString();
 }
@@ -434,35 +438,44 @@ async function finishConsent(request: Request, env: OAuthEnv, helpers: OAuthHelp
       return oauthError("The consent request was invalid or expired", 400, true);
     }
 
+    if (input.decision === "approve" && input.shared_client_access_acknowledged !== true) {
+      return oauthError("Who can use this client account must be acknowledged before access is granted", 400);
+    }
+
     await env.OAUTH_KV.delete(key);
     if (input.decision === "deny") {
       return jsonResponse({ redirectTo: deniedRedirect(stored.request) }, 200, { "set-cookie": clearCsrfCookie() });
     }
 
-    let user;
-    try {
-      user = await authenticateUserOrLegacyOwner(request, env);
-    } catch (error) {
-      if (error instanceof MailMeshError && error.status === 429) {
-        return oauthError(error.message, 429, true);
-      }
-      return oauthError("The MailMesh username or password was not accepted", 401, true);
+    const rateLimit = await env.OAUTH_FLOW_RATE_LIMITER.limit({ key: oauthFlowRateKey(request, "approve") });
+    if (!rateLimit.success) return oauthError("Too many approval attempts. Try again in one minute", 429, true);
+    if (!(await hasValidBearerToken(request, env.MAILMESH_TOKEN))) {
+      return oauthError("The MailMesh instance token was not accepted", 401, true);
     }
 
     const client = await helpers.lookupClient(stored.request.clientId);
     if (!client) return oauthError("The OAuth client no longer exists", 400, true);
+    const { authVersion } = await getMcpAuthorization(env.DB);
+    const authorizedAt = new Date().toISOString();
     const { redirectTo } = await helpers.completeAuthorization({
       request: stored.request,
-      userId: user.id,
-      metadata: { kind: "mailmesh-mcp", authorizedAt: new Date().toISOString() },
+      userId: MCP_GRANT_PRINCIPAL,
+      revokeExistingGrants: false,
+      metadata: {
+        kind: "mailmesh-mcp",
+        authVersion,
+        authorizedAt,
+        sharedClientAccessAcknowledgedAt: authorizedAt,
+        sharedClientAccessAcknowledgementVersion: SHARED_CLIENT_ACCESS_ACKNOWLEDGEMENT_VERSION,
+      },
       scope: stored.scopes,
       props: {
-        principal: `user:${user.id}`,
+        principal: MCP_GRANT_PRINCIPAL,
         authType: "oauth",
         scopes: stored.scopes,
-        userId: user.id,
-        authVersion: user.authVersion,
+        authVersion,
         canCreateDrafts: stored.canCreateDrafts,
+        sharedClientAccessAcknowledgementVersion: SHARED_CLIENT_ACCESS_ACKNOWLEDGEMENT_VERSION,
       },
     });
     return jsonResponse({ redirectTo }, 200, { "set-cookie": clearCsrfCookie() });
@@ -495,10 +508,14 @@ function isTrustedMcpClientRedirect(value: string): boolean {
   if (value.length > 2_048) return false;
   try {
     const url = new URL(value);
-    if (url.protocol !== "https:" || url.port || url.username || url.password || url.hash) return false;
+    if (url.protocol !== "https:" || url.port || url.username || url.password || url.search || url.hash) return false;
     const hostname = url.hostname.toLowerCase();
     if (hostname === "claude.ai") return url.pathname === "/api/mcp/auth_callback";
-    return hostname === "chatgpt.com" || hostname === "auth.openai.com";
+    if (hostname === "chatgpt.com") {
+      if (url.pathname === "/connector_platform_oauth_redirect") return true;
+      return /^\/connector\/oauth\/[A-Za-z0-9._~-]{1,256}$/.test(url.pathname);
+    }
+    return hostname === "auth.openai.com" && url.pathname === "/mcp/callback";
   } catch {
     return false;
   }

@@ -26,35 +26,37 @@ vi.mock("agents/mcp", () => ({
   createMcpHandler: mocks.createMcpHandler,
 }));
 
+vi.mock("../src/db", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../src/db")>(),
+  getMcpAuthorization: vi.fn(),
+}));
+
 vi.mock("../src/mcp", () => ({
   createMailMeshServer: mocks.createMailMeshServer,
 }));
 
+import { getMcpAuthorization } from "../src/db";
 import worker from "../src/index";
+import {
+  MAILMESH_MCP_ACCESS_TOKEN_TTL_SECONDS,
+  MAILMESH_MCP_REFRESH_TOKEN_TTL_SECONDS,
+  MCP_GRANT_PRINCIPAL,
+  MCP_GRANT_REVOCATION_RETENTION_SECONDS,
+  SHARED_CLIENT_ACCESS_ACKNOWLEDGEMENT_VERSION,
+} from "../src/mcp-oauth-policy";
 
 const origin = "https://mailmesh.example.com";
+const grantId = "A1b2C3d4E5f6G7h8";
+const otherGrantId = "Z9y8X7w6V5u4T3s2";
 
 interface GrantProps {
   principal: string;
   authType: "oauth" | "static";
   scopes: string[];
-  userId?: string;
   authVersion?: number;
   canCreateDrafts?: boolean;
-}
-
-interface UserRow {
-  id: string;
-  username: string;
-  display_name: string;
-  password_algorithm: string;
-  password_hash: string;
-  password_salt: string;
-  password_iterations: number;
-  auth_version: number;
-  enabled: number;
-  created_at: string;
-  updated_at: string;
+  sharedClientAccessAcknowledgementVersion?: number;
+  grantId?: string;
 }
 
 interface CapturedOAuthProviderConfiguration {
@@ -62,195 +64,238 @@ interface CapturedOAuthProviderConfiguration {
     audience: string;
     props: GrantProps;
   } | null>;
+  tokenExchangeCallback(options: {
+    requestedScope: string[];
+    userId: string;
+    grantId: string;
+    props: unknown;
+  }): Promise<{ newProps: GrantProps } | void>;
 }
 
-function userRow(id: string, authVersion = 1, enabled = true): UserRow {
-  return {
-    id,
-    username: id === "mailmesh-owner" ? "owner" : id,
-    display_name: id,
-    password_algorithm: "pbkdf2-sha256-hmac-pepper-v1",
-    password_hash: "test-hash",
-    password_salt: "test-salt",
-    password_iterations: 50_000,
-    auth_version: authVersion,
-    enabled: enabled ? 1 : 0,
-    created_at: "2026-08-14T00:00:00.000Z",
-    updated_at: "2026-08-14T00:00:00.000Z",
-  };
-}
-
-function environment(rows: UserRow[]) {
-  const users = new Map(rows.map((row) => [row.id, row]));
-  const lookedUpUserIds: string[] = [];
-  const prepare = vi.fn((_sql: string) => ({
-    bind: vi.fn((userId: string) => ({
-      first: vi.fn(async () => {
-        lookedUpUserIds.push(userId);
-        return users.get(userId) ?? null;
-      }),
-    })),
+function environment(authVersion = 1, revokedGrantIds: string[] = []) {
+  const authorization = { authVersion };
+  const revoked = new Set(revokedGrantIds);
+  vi.mocked(getMcpAuthorization).mockImplementation(async (_db, lookupGrantId) => ({
+    authVersion: authorization.authVersion,
+    grantRevoked: lookupGrantId !== undefined && revoked.has(lookupGrantId),
   }));
   const env = {
-    DB: { prepare } as unknown as D1Database,
+    DB: {} as D1Database,
     OAUTH_KV: {} as KVNamespace,
     OAUTH_FLOW_RATE_LIMITER: {} as RateLimit,
-    MAILMESH_TOKEN: "owner-token-with-high-entropy-for-tests",
+    MAILMESH_TOKEN: "instance-token-with-high-entropy-for-tests",
     TOKEN_ENCRYPTION_KEY: Buffer.alloc(32, 9).toString("base64"),
     PUBLIC_BASE_URL: origin,
     WRITE_MODE: "read-only",
   } satisfies Env;
-  return { env, lookedUpUserIds };
-}
-
-function executionContext(props: GrantProps): ExecutionContext {
-  return {
-    props,
-    waitUntil: vi.fn(),
-    passThroughOnException: vi.fn(),
-  } as unknown as ExecutionContext;
+  return { env, authorization, revoked };
 }
 
 async function requestMcp(env: Env, props: GrantProps): Promise<Response> {
   return worker.fetch(
     new Request(`${origin}/mcp`, { method: "POST" }),
     env,
-    executionContext(props),
+    {
+      props,
+      waitUntil: vi.fn(),
+      passThroughOnException: vi.fn(),
+    } as unknown as ExecutionContext,
   );
 }
 
-function tenantGrant(userId: string, authVersion: number): GrantProps {
+function instanceGrant(overrides: Partial<GrantProps> = {}): GrantProps {
   return {
-    principal: `user:${userId}`,
+    principal: MCP_GRANT_PRINCIPAL,
     authType: "oauth",
     scopes: ["mail:read"],
-    userId,
-    authVersion,
+    authVersion: 1,
+    sharedClientAccessAcknowledgementVersion: SHARED_CLIENT_ACCESS_ACKNOWLEDGEMENT_VERSION,
+    grantId,
+    ...overrides,
   };
+}
+
+function oauthConfiguration(): CapturedOAuthProviderConfiguration {
+  const configuration = mocks.oauthProviderConfigurations.at(-1);
+  if (!configuration) throw new Error("OAuth provider was not initialized");
+  return configuration as CapturedOAuthProviderConfiguration;
+}
+
+function exchangeOptions(overrides: Partial<Parameters<CapturedOAuthProviderConfiguration["tokenExchangeCallback"]>[0]> = {}) {
+  return { requestedScope: ["mail:read"], userId: MCP_GRANT_PRINCIPAL, grantId, props: instanceGrant(), ...overrides };
 }
 
 describe("MCP runtime grant validation", () => {
   beforeEach(() => {
     mocks.oauthProviderConfigurations.length = 0;
     vi.clearAllMocks();
-    mocks.createMailMeshServer.mockImplementation((_env, userId, capabilities) => ({
-      userId,
-      capabilities,
-    }));
-    mocks.createMcpHandler.mockImplementation((server) => async () => new Response(
-      JSON.stringify(server),
-      { headers: { "content-type": "application/json" } },
-    ));
+    mocks.createMailMeshServer.mockImplementation((_env, capabilities) => ({ capabilities }));
+    mocks.createMcpHandler.mockImplementation((server) => async () => Response.json(server));
+  });
+
+  it("retains targeted revocations beyond the grant and access-token lifetime", () => {
+    expect(MCP_GRANT_REVOCATION_RETENTION_SECONDS).toBeGreaterThan(
+      MAILMESH_MCP_REFRESH_TOKEN_TTL_SECONDS + MAILMESH_MCP_ACCESS_TOKEN_TTL_SECONDS,
+    );
+  });
+
+  it.each(["mailmesh-owner", "user:mailmesh-owner", "user:user-a"])(
+    "forces a legacy %s grant through consent again",
+    async (principal) => {
+      const { env } = environment();
+      const response = await requestMcp(env, instanceGrant({ principal }));
+
+      expect(response.status).toBe(401);
+      await expect(response.json()).resolves.toMatchObject({
+        error: "invalid_token",
+        error_description: expect.stringContaining("Reconnect"),
+      });
+      expect(response.headers.get("www-authenticate")).toContain('error="invalid_token"');
+      expect(getMcpAuthorization).not.toHaveBeenCalled();
+      expect(mocks.createMailMeshServer).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([undefined, 0, 2, 999])("rejects unsupported client-access acknowledgement version %s", async (version) => {
+    const { env } = environment();
+    const response = await requestMcp(env, instanceGrant({ sharedClientAccessAcknowledgementVersion: version }));
+
+    expect(response.status).toBe(401);
+    expect(getMcpAuthorization).not.toHaveBeenCalled();
+    expect(mocks.createMailMeshServer).not.toHaveBeenCalled();
   });
 
   it.each([
-    ["disabled", [userRow("user-a", 4, false)]],
-    ["deleted", []],
-  ])("rejects a grant after its user is %s", async (_state, rows) => {
-    const { env, lookedUpUserIds } = environment(rows);
-
-    const response = await requestMcp(env, tenantGrant("user-a", 4));
-
-    expect(response.status).toBe(401);
-    await expect(response.json()).resolves.toMatchObject({
-      error: "invalid_token",
-      error_description: "The MailMesh user is unavailable",
-    });
-    expect(lookedUpUserIds).toEqual(["user-a"]);
-    expect(mocks.createMailMeshServer).not.toHaveBeenCalled();
-    expect(mocks.createMcpHandler).not.toHaveBeenCalled();
-  });
-
-  it("rejects a grant after a password reset changes authVersion", async () => {
-    const { env } = environment([userRow("user-a", 8)]);
-
-    const response = await requestMcp(env, tenantGrant("user-a", 7));
+    { authVersion: undefined },
+    { authVersion: 0 },
+    { authVersion: Number.NaN },
+    { grantId: undefined },
+    { grantId: "malformed" },
+  ])("rejects malformed grant claims %j", async (overrides) => {
+    const { env } = environment();
+    const response = await requestMcp(env, instanceGrant(overrides));
 
     expect(response.status).toBe(401);
-    await expect(response.json()).resolves.toMatchObject({ error: "invalid_token" });
+    expect(getMcpAuthorization).not.toHaveBeenCalled();
     expect(mocks.createMailMeshServer).not.toHaveBeenCalled();
   });
 
-  it("accepts a current grant and constructs a server for only that tenant", async () => {
-    const { env } = environment([
-      userRow("user-a", 8),
-      userRow("user-b", 3),
-    ]);
+  it("rejects grants without mail:read scope", async () => {
+    const { env } = environment();
+    const response = await requestMcp(env, instanceGrant({ scopes: ["offline_access"] }));
 
-    const response = await requestMcp(env, tenantGrant("user-a", 8));
+    expect(response.status).toBe(403);
+    expect(getMcpAuthorization).not.toHaveBeenCalled();
+    expect(mocks.createMailMeshServer).not.toHaveBeenCalled();
+  });
+
+  it("rejects stale OAuth grants after the instance authorization version changes", async () => {
+    const { env, authorization } = environment();
+    expect((await requestMcp(env, instanceGrant())).status).toBe(200);
+
+    authorization.authVersion = 2;
+    const stale = await requestMcp(env, instanceGrant());
+    const current = await requestMcp(env, instanceGrant({ authVersion: 2 }));
+
+    expect(stale.status).toBe(401);
+    expect(current.status).toBe(200);
+    expect(mocks.createMailMeshServer).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts a current grant and passes its draft permissions to the server", async () => {
+    const { env } = environment(8);
+    const response = await requestMcp(env, instanceGrant({ authVersion: 8, canCreateDrafts: true }));
 
     expect(response.status).toBe(200);
-    expect(mocks.createMailMeshServer).toHaveBeenCalledOnce();
-    expect(mocks.createMailMeshServer).toHaveBeenCalledWith(
-      env,
-      "user-a",
-      { createDrafts: false },
-    );
-    await expect(response.json()).resolves.toMatchObject({ userId: "user-a" });
+    expect(getMcpAuthorization).toHaveBeenCalledWith(env.DB, grantId);
+    expect(mocks.createMailMeshServer).toHaveBeenCalledWith(env, { createDrafts: true });
   });
 
-  it("keeps legacy owner grants compatible while scoping them to the reserved owner", async () => {
-    const { env, lookedUpUserIds } = environment([
-      userRow("mailmesh-owner", 12),
-      userRow("user-a", 4),
-    ]);
+  it("rejects a revoked grant and accepts another grant from the same instance", async () => {
+    const { env } = environment(1, [grantId]);
+    const denied = await requestMcp(env, instanceGrant());
+    const allowed = await requestMcp(env, instanceGrant({ grantId: otherGrantId }));
 
-    const response = await requestMcp(env, {
-      principal: "mailmesh-owner",
-      authType: "oauth",
-      scopes: ["mail:read"],
-    });
-
-    expect(response.status).toBe(200);
-    expect(lookedUpUserIds).toEqual(["mailmesh-owner"]);
-    expect(mocks.createMailMeshServer).toHaveBeenCalledWith(
-      env,
-      "mailmesh-owner",
-      { createDrafts: false },
-    );
+    expect(denied.status).toBe(401);
+    expect(allowed.status).toBe(200);
+    expect(mocks.createMailMeshServer).toHaveBeenCalledTimes(1);
   });
 
-  it("does not treat another legacy-style principal as an owner grant", async () => {
-    const { env, lookedUpUserIds } = environment([userRow("mailmesh-owner")]);
+  it("attaches the provider's stable grant ID during token exchange", async () => {
+    const { env } = environment();
+    await requestMcp(env, instanceGrant());
 
-    const response = await requestMcp(env, {
-      principal: "user-a",
-      authType: "oauth",
-      scopes: ["mail:read"],
-    });
+    const result = await oauthConfiguration().tokenExchangeCallback(
+      exchangeOptions({ props: instanceGrant({ grantId: undefined }) }),
+    );
+
+    expect(result).toMatchObject({ newProps: { principal: MCP_GRANT_PRINCIPAL, grantId } });
+  });
+
+  it("rejects token exchange of a revoked grant", async () => {
+    const { env } = environment(1, [grantId]);
+    await requestMcp(env, instanceGrant());
+
+    await expect(oauthConfiguration().tokenExchangeCallback(exchangeOptions())).rejects.toThrow();
+  });
+
+  it("rejects a token minted by a refresh that raced a targeted revocation", async () => {
+    const { env, revoked } = environment();
+    await requestMcp(env, instanceGrant());
+    const exchanged = await oauthConfiguration().tokenExchangeCallback(exchangeOptions());
+    if (!exchanged) throw new Error("Expected new token props");
+    revoked.add(grantId);
+
+    const response = await requestMcp(env, exchanged.newProps);
 
     expect(response.status).toBe(401);
-    await expect(response.json()).resolves.toMatchObject({
-      error: "invalid_token",
-      error_description: "The MailMesh user is missing",
-    });
-    expect(lookedUpUserIds).toEqual([]);
-    expect(mocks.createMailMeshServer).not.toHaveBeenCalled();
+    expect(mocks.createMailMeshServer).toHaveBeenCalledTimes(1);
   });
 
-  it("resolves the static owner token to the reserved owner only", async () => {
-    const { env, lookedUpUserIds } = environment([
-      userRow("mailmesh-owner", 12),
-      userRow("user-a", 4),
-    ]);
+  it.each([
+    ["legacy grant namespace", { userId: "mailmesh-owner" }],
+    ["legacy grant props", { props: instanceGrant({ principal: "user:mailmesh-owner" }) }],
+    ["unacknowledged grant", { props: instanceGrant({ sharedClientAccessAcknowledgementVersion: undefined }) }],
+    ["stale authorization version", { props: instanceGrant({ authVersion: 2 }) }],
+    ["mismatched embedded grant ID", { props: instanceGrant({ grantId: otherGrantId }) }],
+    ["missing read scope", { requestedScope: ["offline_access"] }],
+  ])("rejects token exchange with %s", async (_label, overrides) => {
+    const { env } = environment();
+    await requestMcp(env, instanceGrant());
 
-    await requestMcp(env, tenantGrant("user-a", 4));
-    const configuration = mocks.oauthProviderConfigurations.at(-1) as CapturedOAuthProviderConfiguration;
-    const resolved = await configuration.resolveExternalToken({
-      token: env.MAILMESH_TOKEN,
-      env,
-    });
+    await expect(oauthConfiguration().tokenExchangeCallback(exchangeOptions(overrides))).rejects.toThrow();
+  });
 
-    expect(resolved).toMatchObject({
+  it("resolves only the instance token for static MCP access after checking the schema", async () => {
+    const { env } = environment();
+    await requestMcp(env, instanceGrant());
+    vi.mocked(getMcpAuthorization).mockClear();
+    const { resolveExternalToken } = oauthConfiguration();
+
+    await expect(resolveExternalToken({ token: "wrong-token", env })).resolves.toBeNull();
+    expect(getMcpAuthorization).not.toHaveBeenCalled();
+
+    const staticAccess = await resolveExternalToken({ token: env.MAILMESH_TOKEN, env });
+    if (!staticAccess) throw new Error("Expected static access");
+    expect(staticAccess).toEqual({
       audience: `${origin}/mcp`,
       props: {
-        principal: "mailmesh-owner",
+        principal: MCP_GRANT_PRINCIPAL,
         authType: "static",
-        userId: "mailmesh-owner",
-        authVersion: 12,
         scopes: ["mail:read"],
+        canCreateDrafts: false,
       },
     });
-    expect(lookedUpUserIds).toEqual(["user-a", "mailmesh-owner"]);
+    expect(getMcpAuthorization).toHaveBeenCalledWith(env.DB);
+    expect((await requestMcp(env, staticAccess.props)).status).toBe(200);
+  });
+
+  it("fails closed on a missing workspace schema", async () => {
+    const { env } = environment();
+    vi.mocked(getMcpAuthorization).mockRejectedValue(new Error("workspace schema unavailable"));
+
+    expect((await requestMcp(env, instanceGrant())).status).toBe(500);
+    await expect(oauthConfiguration().resolveExternalToken({ token: env.MAILMESH_TOKEN, env })).rejects.toThrow();
+    expect(mocks.createMailMeshServer).not.toHaveBeenCalled();
   });
 });
